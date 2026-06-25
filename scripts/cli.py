@@ -104,7 +104,7 @@ class RecipeJEPA(nn.Module):
             x = self._pool_active_tokens(tokens, self.target_embedding)
             return self.target_encoder(x)
 
-    def forward(self, x_tokens: torch.Tensor, a_tokens: torch.Tensor) -> torch.Tensor:
+    def forward(self, x_tokens: torch.Tensor, a_tokens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         z_t = self.encode_state(x_tokens)
         a_mask = (a_tokens != 0).float()
         a_embed = self.embedding(a_tokens)
@@ -112,7 +112,8 @@ class RecipeJEPA(nn.Module):
         latent_delta = self.predictor(z_t, u_seq, a_mask)
         normalized_delta = self.delta_norm(latent_delta)
         z_next_pred = self.prediction_norm(z_t + self.action_gate * normalized_delta)
-        return z_next_pred
+        return z_next_pred, z_t
+        # return nn.functional.normalize(z_next_pred, p=2, dim=-1)
 
     @torch.no_grad()
     def update_target_ema(self, momentum: float = 0.99):
@@ -128,33 +129,41 @@ class RecipeJEPA(nn.Module):
 
 
 def vicreg_loss(
-    z_a: torch.Tensor,
-    z_b: torch.Tensor,
+    z_pred: torch.Tensor,
+    z_true: torch.Tensor,
+    z_t: torch.Tensor,  # Raw input embedding: encode_state(x_tokens)
     sim_coeff: float = 25.0,
     var_coeff: float = 25.0,
     cov_coeff: float = 5.0,
+    repel_coeff: float = 15.0,  # Strength of the shortcut penalty
+    threshold: float = 0.25,  # Distance threshold (adjust based on latent space scaling)
     gamma: float = 1.0,
     eps: float = 1e-4,
 ):
-    batch_size, num_features = z_a.shape
-    sim_loss = nn.functional.mse_loss(z_a, z_b)
+    batch_size, num_features = z_pred.shape
+    sim_loss = nn.functional.mse_loss(z_pred, z_true)
 
-    std_a = torch.sqrt(z_a.var(dim=0) + eps)
-    std_b = torch.sqrt(z_b.var(dim=0) + eps)
+    # 2. List Repulsion Penalty (Hinge loss pushing prediction away from raw state)
+    # Measures how far the predictor moved the representation from the ingredient base
+    shortcut_distance = torch.mean((z_pred - z_t) ** 2, dim=-1)
+    repel_loss = torch.mean(nn.functional.relu(shortcut_distance - threshold))
+
+    std_a = torch.sqrt(z_pred.var(dim=0) + eps)
+    std_b = torch.sqrt(z_true.var(dim=0) + eps)
     var_loss_a = torch.mean(nn.functional.relu(gamma - std_a))
     var_loss_b = torch.mean(nn.functional.relu(gamma - std_b))
     std_loss = var_loss_a + var_loss_b
 
-    z_a_zero_mean = z_a - z_a.mean(dim=0)
-    z_b_zero_mean = z_b - z_b.mean(dim=0)
-    cov_a = (z_a_zero_mean.T @ z_a_zero_mean) / (batch_size - 1)
-    cov_b = (z_b_zero_mean.T @ z_b_zero_mean) / (batch_size - 1)
+    z_pred_zero_mean = z_pred - z_pred.mean(dim=0)
+    z_true_zero_mean = z_true - z_true.mean(dim=0)
+    cov_a = (z_pred_zero_mean.T @ z_pred_zero_mean) / (batch_size - 1)
+    cov_b = (z_true_zero_mean.T @ z_true_zero_mean) / (batch_size - 1)
     cov_loss_a = cov_a.pow(2).sum() - cov_a.diagonal().pow(2).sum()
     cov_loss_b = cov_b.pow(2).sum() - cov_b.diagonal().pow(2).sum()
     cov_loss = (cov_loss_a + cov_loss_b) / num_features
 
-    total_loss = (sim_coeff * sim_loss) + (var_coeff * std_loss) + (cov_coeff * cov_loss)
-    return total_loss, sim_loss, std_loss, cov_loss
+    total_loss = (sim_coeff * sim_loss) + (var_coeff * std_loss) + (cov_coeff * cov_loss) + (repel_coeff * repel_loss)
+    return total_loss, sim_loss, std_loss, cov_loss, repel_loss
 
 
 # =====================================================================
@@ -200,7 +209,7 @@ class JEPATrainer:
         for epoch in range(epochs):
             # --- Training Pass ---
             self.model.train()
-            train_loss_monitor = [0.0, 0.0, 0.0]
+            train_loss_monitor = [0.0, 0.0, 0.0, 0.0]
 
             for batch_idx, (x_tokens, a_tokens, y_tokens) in enumerate(self.train_loader):
                 self.optimizer.zero_grad()
@@ -210,38 +219,50 @@ class JEPATrainer:
                     y_tokens.to(self.device),
                 )
 
-                pred_embed = self.model(x_tokens, a_tokens)
+                pred_embed, z_t = self.model(x_tokens, a_tokens)
                 with torch.no_grad():
                     true_embed = self.model.encode_target(y_tokens).detach()
 
-                total_loss, sim_loss, std_loss, cov_loss = vicreg_loss(pred_embed, true_embed)
-                sim_val, std_val, cov_val = sim_loss.item(), std_loss.item(), cov_loss.item()
+                total_loss, sim_loss, std_loss, cov_loss, repel_loss = vicreg_loss(
+                    z_pred=pred_embed, z_true=true_embed, z_t=z_t
+                )
+                sim_train, std_train, cov_train, rep_train = (
+                    sim_loss.item(),
+                    std_loss.item(),
+                    cov_loss.item(),
+                    repel_loss.item(),
+                )
 
                 total_loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                 self.optimizer.step()
                 self.scheduler.step()
 
-                self.model.update_target_ema(momentum=0.999)
+                self.model.update_target_ema(momentum=0.99)
 
                 self.writer.add_scalar("Loss/Train_Total_Step", total_loss.item(), self.global_step)
-                self.writer.add_scalar("Loss/Train_SIM_Step", sim_val, self.global_step)
-                self.writer.add_scalar("Loss/Train_STD_Step", std_val, self.global_step)
-                self.writer.add_scalar("Loss/Train_COV_Step", cov_val, self.global_step)
+                self.writer.add_scalar("Loss/Train_SIM_Step", sim_train, self.global_step)
+                self.writer.add_scalar("Loss/Train_STD_Step", std_train, self.global_step)
+                self.writer.add_scalar("Loss/Train_COV_Step", cov_train, self.global_step)
+                self.writer.add_scalar("Loss/Train_Repel_Step", rep_train, self.global_step)
                 self.writer.add_scalar(
                     "Hyperparameters/Learning_Rate", self.scheduler.get_last_lr()[0], self.global_step
                 )
 
-                train_loss_monitor[0] += sim_val
-                train_loss_monitor[1] += std_val
-                train_loss_monitor[2] += cov_val
+                train_loss_monitor[0] += sim_train
+                train_loss_monitor[1] += std_train
+                train_loss_monitor[2] += cov_train
+                train_loss_monitor[3] += rep_train
                 self.global_step += 1
 
                 if (batch_idx + 1) % 10 == 0 or batch_idx == 0:
                     print(
                         f"Epoch {epoch + 1:02d} |",
                         f"Train Batch {batch_idx + 1}/{len(self.train_loader)} |",
-                        f"SIM: {sim_val:.4f}",
+                        f"SIM: {sim_train:.4f} |",
+                        f"STD: {std_train:.4f} |",
+                        f"COV: {cov_train:.4f} |",
+                        f"REP: {rep_train:.4f}",
                     )
 
                 if self.device.type == "mps":
@@ -251,25 +272,29 @@ class JEPATrainer:
             epoch_train_sim = train_loss_monitor[0] / len(self.train_loader)
             epoch_train_std = train_loss_monitor[1] / len(self.train_loader)
             epoch_train_cov = train_loss_monitor[2] / len(self.train_loader)
+            epoch_train_rep = train_loss_monitor[3] / len(self.train_loader)
 
             # --- Validation Pass ---
-            epoch_val_sim, epoch_val_std, epoch_val_cov = self.validate()
+            epoch_val_sim, epoch_val_std, epoch_val_cov, epoch_val_rep = self.validate()
 
             # TensorBoard Logging
             self.writer.add_scalars("Epoch/Invariance_SIM", {"train": epoch_train_sim, "val": epoch_val_sim}, epoch)
             self.writer.add_scalars("Epoch/Variance_STD", {"train": epoch_train_std, "val": epoch_val_std}, epoch)
             self.writer.add_scalars("Epoch/Covariance_COV", {"train": epoch_train_cov, "val": epoch_val_cov}, epoch)
+            self.writer.add_scalars("Epoch/Repulsion", {"train": epoch_train_rep, "val": epoch_val_rep}, epoch)
 
             print(f"--- Epoch {epoch + 1} Summary ---")
             print(
                 f" [TRAIN] Mean SIM: {epoch_train_sim:.4f} |",
                 f"Mean STD: {epoch_train_std:.4f} |",
-                f"Mean COV: {epoch_train_cov:.4f}",
+                f"Mean COV: {epoch_train_cov:.4f} |",
+                f"Mean REP: {epoch_train_rep:.4f}",
             )
             print(
                 f" [VAL]   Mean SIM: {epoch_val_sim:.4f} |",
                 f"Mean STD: {epoch_val_std:.4f} |",
-                f"Mean COV: {epoch_val_cov:.4f}",
+                f"Mean COV: {epoch_val_cov:.4f} |",
+                f"Mean REP: {epoch_val_rep:.4f}",
             )
 
             # --- Early Stopping Evaluation ---
@@ -303,23 +328,25 @@ class JEPATrainer:
     @torch.no_grad()
     def validate(self):
         self.model.eval()
-        val_loss_monitor = [0.0, 0.0, 0.0]
+        val_loss_monitor = [0.0, 0.0, 0.0, 0.0]
 
         for x_tokens, a_tokens, y_tokens in self.val_loader:
             x_tokens, a_tokens, y_tokens = x_tokens.to(self.device), a_tokens.to(self.device), y_tokens.to(self.device)
-            pred_embed = self.model(x_tokens, a_tokens)
+            pred_embed, z_t = self.model(x_tokens, a_tokens)
             true_embed = self.model.encode_target(y_tokens).detach()
 
-            _, sim_loss, std_loss, cov_loss = vicreg_loss(pred_embed, true_embed)
+            _, sim_loss, std_loss, cov_loss, rep_loss = vicreg_loss(pred_embed, true_embed, z_t)
 
             val_loss_monitor[0] += sim_loss.item()
             val_loss_monitor[1] += std_loss.item()
             val_loss_monitor[2] += cov_loss.item()
+            val_loss_monitor[3] += rep_loss.item()
 
         val_sim = val_loss_monitor[0] / len(self.val_loader)
         val_std = val_loss_monitor[1] / len(self.val_loader)
         val_cov = val_loss_monitor[2] / len(self.val_loader)
-        return val_sim, val_std, val_cov
+        val_rep = val_loss_monitor[3] / len(self.val_loader)
+        return val_sim, val_std, val_cov, val_rep
 
 
 # =====================================================================
@@ -384,14 +411,14 @@ def handle_inference(args, device):
         a_enc = tokenizer(args.action, max_length=128, padding="max_length", truncation=True, return_tensors="pt")
         a_tokens = a_enc["input_ids"].to(device)
 
-        pred_z_next = model(x_tokens, a_tokens)
-        pred_z_next = nn.functional.normalize(pred_z_next, p=2, dim=-1)
+        pred_z_next, _ = model(x_tokens, a_tokens)
+        # pred_z_next = nn.functional.normalize(pred_z_next, p=2, dim=-1)
 
         y_enc = tokenizer(targets_list, max_length=128, padding="max_length", truncation=True, return_tensors="pt")
         y_tokens_batch = y_enc["input_ids"].to(device)
 
         true_z_next_batch = model.encode_state(y_tokens_batch)
-        true_z_next_batch = nn.functional.normalize(true_z_next_batch, p=2, dim=-1)
+        # true_z_next_batch = nn.functional.normalize(true_z_next_batch, p=2, dim=-1)
 
         rankings = []
         for idx, target_str in enumerate(targets_list):
@@ -425,7 +452,7 @@ def main():
     train_parser.add_argument("--val_dataset", type=str, default="data/recipe_val.parquet")
     train_parser.add_argument("--output_dir", type=str, default="checkpoints")
     train_parser.add_argument("--log_dir", type=str, default="runs/recipe_jepa_experiment")
-    train_parser.add_argument("--batch_size", type=int, default=8)
+    train_parser.add_argument("--batch_size", type=int, default=64)
     train_parser.add_argument("--epochs", type=int, default=50)
     train_parser.add_argument("--lr", type=float, default=2e-4)
     # New CLI Early Stopping Arguments
