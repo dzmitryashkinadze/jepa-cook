@@ -58,9 +58,8 @@ data_sampled = (
 )
 
 # ==============================================================================
-# NEW: Synthetic State-Action-State Triples Block
+# Synthetic State-Action-State Triples Block
 # ==============================================================================
-# Define your base food components and how major actions transition them.
 triples_raw = [
     # --- COOK (General Heat / Simmer / Steam) ---
     {"ingredients": "pasta water", "action_text": "cook", "directions": "cooked al dente pasta"},
@@ -134,26 +133,41 @@ triples_raw = [
     {"ingredients": "marshmallow", "action_text": "toast", "directions": "gooey roasted toasted marshmallow"},
 ]
 
-# Create an identical schema DataFrame for the synthetic triples
 synthetic_df = pl.DataFrame(
     triples_raw, schema={"ingredients": pl.String, "action_text": pl.String, "directions": pl.String}
 )
 
-# Use select matching to ensure column structural ordering matches perfectly
 data_sampled = data_sampled.select(["ingredients", "action_text", "directions"])
 synthetic_df = synthetic_df.select(["ingredients", "action_text", "directions"])
 
-# Append the synthetic foundational world-knowledge to your real dataset
+# Append foundational knowledge triples
 data_sampled = data_sampled.vstack(synthetic_df)
 data_sampled.write_csv("data/recipe_sampled.csv")
-# ==============================================================================
 
-# Apply tokenization transformations across all 3 components (including synthetic)
+# Tokenize across all data parts
 data_sampled = data_sampled.with_columns([
     pl.col("ingredients").map_batches(encode_and_pad).alias("x_tokens"),
     pl.col("action_text").map_batches(encode_and_pad).alias("a_tokens"),
     pl.col("directions").map_batches(encode_and_pad).alias("y_tokens"),
 ])
 
-data_sampled.select(["x_tokens", "a_tokens", "y_tokens"]).write_parquet("data/recipe_sampled.parquet")
-print(f"Done! Saved {len(data_sampled)} records (including {len(synthetic_df)} explicit action triples).")
+# Complete dataset containing the token columns
+tokenized_df = data_sampled.select(["x_tokens", "a_tokens", "y_tokens"])
+
+# Reshuffle now so synthetic data is thoroughly spread between both sets
+shuffled_df = tokenized_df.sample(fraction=1.0, shuffle=True, seed=42)
+
+total_rows = len(shuffled_df)
+train_size = int(total_rows * 0.8)
+
+train_df = shuffled_df.slice(0, train_size)
+val_df = shuffled_df.slice(train_size, total_rows - train_size)
+
+# Output splits out as individual parquet files
+train_df.write_parquet("data/recipe_train.parquet")
+val_df.write_parquet("data/recipe_val.parquet")
+
+print("Done! Splitting sequence execution completed successfully.")
+print(f" -> Total processed dataset: {total_rows} records.")
+print(f" -> Training fold:           {len(train_df)} rows saved to data/recipe_train.parquet")
+print(f" -> Validation fold:         {len(val_df)} rows saved to data/recipe_val.parquet")
