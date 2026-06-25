@@ -14,7 +14,7 @@ from torch.utils.tensorboard import SummaryWriter
 from transformers import AutoTokenizer
 
 # =====================================================================
-# 1. DATASETS & MODELS
+# 1. DATASETS
 # =====================================================================
 
 
@@ -43,7 +43,12 @@ class PreTokenizedActionDataset(Dataset):
         )
 
 
-class TransformerPredictor(nn.Module):
+# =====================================================================
+# 2. MODELS
+# =====================================================================
+
+
+class Predictor(nn.Module):
     def __init__(self, latent_dim: int = 256, nhead: int = 8, num_layers: int = 2):
         super().__init__()
         decoder_layer = nn.TransformerDecoderLayer(
@@ -63,68 +68,112 @@ class TransformerPredictor(nn.Module):
         return out.squeeze(1)
 
 
-class RecipeJEPA(nn.Module):
-    def __init__(self, vocab_size: int = 30522, embed_dim: int = 384, latent_dim: int = 256):
+class Embedding(nn.Module):
+    def __init__(self, vocab_size: int, embed_dim: int):
         super().__init__()
         self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
-        self.target_embedding = copy.deepcopy(self.embedding)
-        for param in self.target_embedding.parameters():
-            param.requires_grad = False
 
-        self.state_encoder = nn.Sequential(
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        return self.embedding(tokens)
+
+
+class IngredientEncoder(nn.Module):
+    def __init__(self, embedding_layer: Embedding, embed_dim: int, latent_dim: int):
+        super().__init__()
+        self.embedding_layer = embedding_layer
+        self.encoder = nn.Sequential(
             nn.Linear(embed_dim, latent_dim), nn.LayerNorm(latent_dim), nn.GELU(), nn.Linear(latent_dim, latent_dim)
         )
 
-        self.target_encoder = copy.deepcopy(self.state_encoder)
-        for param in self.target_encoder.parameters():
-            param.requires_grad = False
+    def _pool_active_tokens(self, tokens: torch.Tensor) -> torch.Tensor:
+        mask = (tokens != 0).float()
+        mask_counts = mask.sum(dim=1, keepdim=True).clamp(min=1.0)
+        # Use the explicit embedding module
+        embeddings = self.embedding_layer(tokens)
+        masked_embeddings = embeddings * mask.unsqueeze(-1)
+        return masked_embeddings.sum(dim=1) / mask_counts
 
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        x = self._pool_active_tokens(tokens)
+        return self.encoder(x)
+
+
+class ActionEncoder(nn.Module):
+    def __init__(self, embedding_layer: Embedding, embed_dim: int, latent_dim: int):
+        super().__init__()
+        self.embedding_layer = embedding_layer
         self.action_sequence_encoder = nn.Sequential(
             nn.Linear(embed_dim, latent_dim), nn.LayerNorm(latent_dim), nn.GELU()
         )
 
-        self.predictor = TransformerPredictor(latent_dim)
+    def forward(self, a_tokens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        a_mask = (a_tokens != 0).float()
+        a_embed = self.embedding_layer(a_tokens)
+        u_seq = self.action_sequence_encoder(a_embed)
+        return u_seq, a_mask
+
+
+class RecipeJEPA(nn.Module):
+    def __init__(self, vocab_size: int = 30522, embed_dim: int = 384, latent_dim: int = 256):
+        super().__init__()
+
+        # 1. Embedding
+        self.embedding = Embedding(vocab_size, embed_dim)
+
+        # 2. Encoders
+        self.ingredient_encoder = IngredientEncoder(self.embedding, embed_dim, latent_dim)
+        self.action_encoder = ActionEncoder(self.embedding, embed_dim, latent_dim)
+
+        # 3. Target
+        self.target_embedding = copy.deepcopy(self.embedding)
+        self.target_encoder = IngredientEncoder(self.target_embedding, embed_dim, latent_dim)
+
+        # Freeze target parameters
+        for param in self.target_embedding.parameters():
+            param.requires_grad = False
+        for param in self.target_encoder.parameters():
+            param.requires_grad = False
+
+        # 4. Predictor and Normalization components
+        self.predictor = Predictor(latent_dim)  # Assumed to be defined elsewhere
         self.delta_norm = nn.LayerNorm(latent_dim)
         self.action_gate = nn.Parameter(torch.tensor([0.1]))
         self.prediction_norm = nn.LayerNorm(latent_dim)
 
-    def _pool_active_tokens(self, tokens: torch.Tensor, embedding_layer: nn.Embedding) -> torch.Tensor:
-        mask = (tokens != 0).float()
-        mask_counts = mask.sum(dim=1, keepdim=True).clamp(min=1.0)
-        embeddings = embedding_layer(tokens)
-        masked_embeddings = embeddings * mask.unsqueeze(-1)
-        return masked_embeddings.sum(dim=1) / mask_counts
-
-    def encode_state(self, tokens: torch.Tensor) -> torch.Tensor:
-        x = self._pool_active_tokens(tokens, self.embedding)
-        return self.state_encoder(x)
+    def encode_ingredients(self, tokens: torch.Tensor) -> torch.Tensor:
+        return self.ingredient_encoder(tokens)
 
     def encode_target(self, tokens: torch.Tensor) -> torch.Tensor:
         with torch.no_grad():
-            x = self._pool_active_tokens(tokens, self.target_embedding)
-            return self.target_encoder(x)
+            return self.target_encoder(tokens)
 
     def forward(self, x_tokens: torch.Tensor, a_tokens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        z_t = self.encode_state(x_tokens)
-        a_mask = (a_tokens != 0).float()
-        a_embed = self.embedding(a_tokens)
-        u_seq = self.action_sequence_encoder(a_embed)
+        z_t = self.encode_ingredients(x_tokens)
+        u_seq, a_mask = self.action_encoder(a_tokens)
+
         latent_delta = self.predictor(z_t, u_seq, a_mask)
         normalized_delta = self.delta_norm(latent_delta)
+
         z_next_pred = self.prediction_norm(z_t + self.action_gate * normalized_delta)
         return z_next_pred, z_t
-        # return nn.functional.normalize(z_next_pred, p=2, dim=-1)
 
     @torch.no_grad()
     def update_target_ema(self, momentum: float = 0.99):
-        for target_param, online_param in zip(self.target_encoder.parameters(), self.state_encoder.parameters()):
-            target_param.data.mul_(momentum).add_(online_param.data, alpha=1.0 - momentum)
-        for target_param, online_param in zip(self.target_embedding.parameters(), self.embedding.parameters()):
-            target_param.data.mul_(momentum).add_(online_param.data, alpha=1.0 - momentum)
+        # Update Target Encoder Weights
+        for target_param, ingredient_param in zip(
+            self.target_encoder.parameters(), self.ingredient_encoder.parameters()
+        ):
+            target_param.data.mul_(momentum).add_(ingredient_param.data, alpha=1.0 - momentum)
+
+        # Update Target Embedding Weights
+        for target_embedding_param, embedding_param in zip(
+            self.target_embedding.parameters(), self.embedding.parameters()
+        ):
+            target_embedding_param.data.mul_(momentum).add_(embedding_param.data, alpha=1.0 - momentum)
 
 
 # =====================================================================
-# 2. LOSS FUNCTION
+# 3. LOSS FUNCTION
 # =====================================================================
 
 
@@ -167,7 +216,7 @@ def vicreg_loss(
 
 
 # =====================================================================
-# 3. TRAINER MODULE (WITH TRAIN/VAL + TENSORBOARD + EARLY STOPPING)
+# 4. TRAINER MODULE (WITH TRAIN/VAL + TENSORBOARD + EARLY STOPPING)
 # =====================================================================
 
 
@@ -350,7 +399,7 @@ class JEPATrainer:
 
 
 # =====================================================================
-# 4. SUBCOMMAND INTERFACES
+# 5. SUBCOMMAND INTERFACES
 # =====================================================================
 
 
@@ -417,7 +466,7 @@ def handle_inference(args, device):
         y_enc = tokenizer(targets_list, max_length=128, padding="max_length", truncation=True, return_tensors="pt")
         y_tokens_batch = y_enc["input_ids"].to(device)
 
-        true_z_next_batch = model.encode_state(y_tokens_batch)
+        true_z_next_batch = model.encode_ingredients(y_tokens_batch)
         # true_z_next_batch = nn.functional.normalize(true_z_next_batch, p=2, dim=-1)
 
         rankings = []
@@ -438,7 +487,7 @@ def handle_inference(args, device):
 
 
 # =====================================================================
-# 5. ENTRYPOINT MAIN
+# 6. ENTRYPOINT MAIN
 # =====================================================================
 
 
@@ -452,10 +501,9 @@ def main():
     train_parser.add_argument("--val_dataset", type=str, default="data/recipe_val.parquet")
     train_parser.add_argument("--output_dir", type=str, default="checkpoints")
     train_parser.add_argument("--log_dir", type=str, default="runs/recipe_jepa_experiment")
-    train_parser.add_argument("--batch_size", type=int, default=64)
+    train_parser.add_argument("--batch_size", type=int, default=8)
     train_parser.add_argument("--epochs", type=int, default=50)
     train_parser.add_argument("--lr", type=float, default=2e-4)
-    # New CLI Early Stopping Arguments
     train_parser.add_argument("--patience", type=int, default=3, help="Number of epochs to wait before stopping")
     train_parser.add_argument(
         "--min_delta", type=float, default=1e-4, help="Minimum improvement required to reset patience"
