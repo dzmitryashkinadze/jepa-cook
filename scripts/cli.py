@@ -1,6 +1,7 @@
 import argparse
 import ast
 import copy
+import json
 import math
 import os
 
@@ -14,38 +15,168 @@ from torch.utils.tensorboard import SummaryWriter
 from transformers import AutoTokenizer
 
 # =====================================================================
-# 1. DATASETS
+# 1. DATASETS & COLLATOR
 # =====================================================================
 
 
 class PreTokenizedActionDataset(Dataset):
-    def __init__(self, dataset_path: str, max_len: int = 128):
+    def __init__(self, dataset_path: str):
+        # Read the structural parquet file natively
         self.df = pl.read_parquet(dataset_path)
-        self.max_len = max_len
 
     def __len__(self):
         return len(self.df)
 
-    def _parse_and_pad(self, token_str: str) -> torch.Tensor:
-        tokens = [int(t) for t in token_str.split()] if token_str else []
-        if len(tokens) < self.max_len:
-            tokens = tokens + [0] * (self.max_len - len(tokens))
-        else:
-            tokens = tokens[: self.max_len]
-        return torch.tensor(tokens, dtype=torch.long)
-
     def __getitem__(self, idx):
         row = self.df.row(idx, named=True)
-        return (
-            self._parse_and_pad(row["x_tokens"]),
-            self._parse_and_pad(row["a_tokens"]),
-            self._parse_and_pad(row["y_tokens"]),
+        # Convert lists of lists / lists directly to tensors
+        x = [torch.tensor(item, dtype=torch.long) for item in row["x_tokens"]]
+        a = [torch.tensor(item, dtype=torch.long) for item in row["a_tokens"]]
+        y = torch.tensor(row["y_tokens"], dtype=torch.long)
+        return x, a, y
+
+
+def pad_nested_sequences(batch_lists, max_len=128):
+    """Pads a nested batch of varied length structural elements into a 3D Tensor.
+
+    Returns: Shape [batch_size, max_elements_in_batch, max_len]
+    """
+    batch_size = len(batch_lists)
+    max_elements = max(len(row) for row in batch_lists)
+    max_elements = max(1, max_elements)  # Safeguard empty rows
+
+    padded_tensor = torch.zeros(batch_size, max_elements, max_len, dtype=torch.long)
+
+    for i, row in enumerate(batch_lists):
+        for j, element in enumerate(row):
+            length = min(len(element), max_len)
+            if length > 0:
+                padded_tensor[i, j, :length] = element[:length]
+
+    return padded_tensor
+
+
+def jepa_collate_fn(batch):
+    xs, as_, ys = zip(*batch)
+
+    # Pad 3D Input structural layers
+    x_tensor = pad_nested_sequences(xs, max_len=128)
+    a_tensor = pad_nested_sequences(as_, max_len=128)
+
+    # Pad 2D Target flat layer
+    y_tensor = torch.nn.utils.rnn.pad_sequence(ys, batch_first=True, padding_value=0)
+    if y_tensor.size(1) < 128:
+        padding = torch.zeros(y_tensor.size(0), 128 - y_tensor.size(1), dtype=torch.long)
+        y_tensor = torch.cat([y_tensor, padding], dim=1)
+    else:
+        y_tensor = y_tensor[:, :128]
+
+    return x_tensor, a_tensor, y_tensor
+
+
+# =====================================================================
+# 2. MODULAR ENCODING ARCHITECTURES
+# =====================================================================
+
+
+class Embedding(nn.Module):
+    def __init__(self, vocab_size: int, embed_dim: int):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
+
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        return self.embedding(tokens)
+
+
+class StructuralGroupEncoder(nn.Module):
+    """Encodes a nested 3D tensor of multiple item components into a singular joint latent vector."""
+
+    def __init__(self, embedding_layer: Embedding, embed_dim: int, latent_dim: int):
+        super().__init__()
+        self.embedding_layer = embedding_layer
+
+        self.element_compressor = nn.Sequential(nn.Linear(embed_dim, latent_dim), nn.LayerNorm(latent_dim), nn.GELU())
+
+        self.joint_projection = nn.Sequential(
+            nn.Linear(latent_dim, latent_dim), nn.LayerNorm(latent_dim), nn.GELU(), nn.Linear(latent_dim, latent_dim)
         )
 
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        # tokens shape: [batch_size, num_elements, max_len]
+        batch_size, num_elements, max_len = tokens.shape
 
-# =====================================================================
-# 2. MODELS
-# =====================================================================
+        # 1. Flatten for uniform embedding step evaluation
+        flat_tokens = tokens.view(-1, max_len)  # [B * N, L]
+        mask = (flat_tokens != 0).float()
+        mask_counts = mask.sum(dim=1, keepdim=True).clamp(min=1.0)
+
+        embeddings = self.embedding_layer(flat_tokens)  # [B * N, L, D]
+        masked_embeddings = embeddings * mask.unsqueeze(-1)
+
+        # Mean pool individual sub-elements text chunks
+        pooled_elements = masked_embeddings.sum(dim=1) / mask_counts  # [B * N, D]
+        element_latents = self.element_compressor(pooled_elements)  # [B * N, H]
+
+        # 2. Re-assemble to row segments structures
+        group_latents = element_latents.view(batch_size, num_elements, -1)  # [B, N, H]
+
+        # Pool all combined elements across rows safely without dimension pollution
+        group_mask = (tokens.sum(dim=-1) != 0).float()  # [B, N]
+        group_counts = group_mask.sum(dim=1, keepdim=True).clamp(min=1.0)  # [B, 1]
+
+        masked_group = group_latents * group_mask.unsqueeze(-1)  # [B, N, H]
+        combined_latent = masked_group.sum(dim=1) / group_counts  # [B, H] / [B, 1] -> [B, H]
+
+        return self.joint_projection(combined_latent)
+
+
+class ActionSequenceEncoder(nn.Module):
+    """Generates structural sequence memories from multi-step action groups for predictor decoding."""
+
+    def __init__(self, embedding_layer: Embedding, embed_dim: int, latent_dim: int):
+        super().__init__()
+        self.embedding_layer = embedding_layer
+        self.compressor = nn.Sequential(nn.Linear(embed_dim, latent_dim), nn.LayerNorm(latent_dim), nn.GELU())
+
+    def forward(self, a_tokens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        # a_tokens shape: [batch_size, num_actions, max_len]
+        batch_size, num_actions, max_len = a_tokens.shape
+
+        flat_actions = a_tokens.view(-1, max_len)
+        mask = (flat_actions != 0).float()
+        mask_counts = mask.sum(dim=1, keepdim=True).clamp(min=1.0)
+
+        embeddings = self.embedding_layer(flat_actions)
+        masked_embeddings = embeddings * mask.unsqueeze(-1)
+
+        pooled_actions = masked_embeddings.sum(dim=1) / mask_counts
+        u_seq = self.compressor(pooled_actions).view(batch_size, num_actions, -1)  # [B, N, H]
+
+        # Action sequence mask profile evaluation
+        a_mask = (a_tokens.sum(dim=-1) != 0).float()  # [B, N]
+        return u_seq, a_mask
+
+
+class TitleTargetEncoder(nn.Module):
+    """Processes flat 2D title targets directly."""
+
+    def __init__(self, embedding_layer: Embedding, embed_dim: int, latent_dim: int):
+        super().__init__()
+        self.embedding_layer = embedding_layer
+        self.encoder = nn.Sequential(
+            nn.Linear(embed_dim, latent_dim), nn.LayerNorm(latent_dim), nn.GELU(), nn.Linear(latent_dim, latent_dim)
+        )
+
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        # tokens shape: [batch_size, max_len]
+        mask = (tokens != 0).float()
+        mask_counts = mask.sum(dim=1, keepdim=True).clamp(min=1.0)
+
+        embeddings = self.embedding_layer(tokens)
+        masked_embeddings = embeddings * mask.unsqueeze(-1)
+        pooled = masked_embeddings.sum(dim=1) / mask_counts
+
+        return self.encoder(pooled)
 
 
 class Predictor(nn.Module):
@@ -63,79 +194,32 @@ class Predictor(nn.Module):
 
     def forward(self, z_t: torch.Tensor, u_seq: torch.Tensor, a_mask: torch.Tensor | None = None) -> torch.Tensor:
         tgt = z_t.unsqueeze(1)
-        mem_mask = (a_mask == 0) if a_mask is not None else None
-        out = self.transformer_decoder(tgt=tgt, memory=u_seq, memory_key_padding_mask=mem_mask)
+        # Invert mask: True for elements that should be IGNORED by attention
+        mem_key_padding_mask = (a_mask == 0) if a_mask is not None else None
+        out = self.transformer_decoder(tgt=tgt, memory=u_seq, memory_key_padding_mask=mem_key_padding_mask)
         return out.squeeze(1)
-
-
-class Embedding(nn.Module):
-    def __init__(self, vocab_size: int, embed_dim: int):
-        super().__init__()
-        self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
-
-    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
-        return self.embedding(tokens)
-
-
-class IngredientEncoder(nn.Module):
-    def __init__(self, embedding_layer: Embedding, embed_dim: int, latent_dim: int):
-        super().__init__()
-        self.embedding_layer = embedding_layer
-        self.encoder = nn.Sequential(
-            nn.Linear(embed_dim, latent_dim), nn.LayerNorm(latent_dim), nn.GELU(), nn.Linear(latent_dim, latent_dim)
-        )
-
-    def _pool_active_tokens(self, tokens: torch.Tensor) -> torch.Tensor:
-        mask = (tokens != 0).float()
-        mask_counts = mask.sum(dim=1, keepdim=True).clamp(min=1.0)
-        # Use the explicit embedding module
-        embeddings = self.embedding_layer(tokens)
-        masked_embeddings = embeddings * mask.unsqueeze(-1)
-        return masked_embeddings.sum(dim=1) / mask_counts
-
-    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
-        x = self._pool_active_tokens(tokens)
-        return self.encoder(x)
-
-
-class ActionEncoder(nn.Module):
-    def __init__(self, embedding_layer: Embedding, embed_dim: int, latent_dim: int):
-        super().__init__()
-        self.embedding_layer = embedding_layer
-        self.action_sequence_encoder = nn.Sequential(
-            nn.Linear(embed_dim, latent_dim), nn.LayerNorm(latent_dim), nn.GELU()
-        )
-
-    def forward(self, a_tokens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        a_mask = (a_tokens != 0).float()
-        a_embed = self.embedding_layer(a_tokens)
-        u_seq = self.action_sequence_encoder(a_embed)
-        return u_seq, a_mask
 
 
 class RecipeJEPA(nn.Module):
     def __init__(self, vocab_size: int = 30522, embed_dim: int = 384, latent_dim: int = 256):
         super().__init__()
 
-        # 1. Embedding
         self.embedding = Embedding(vocab_size, embed_dim)
 
-        # 2. Encoders
-        self.ingredient_encoder = IngredientEncoder(self.embedding, embed_dim, latent_dim)
-        self.action_encoder = ActionEncoder(self.embedding, embed_dim, latent_dim)
+        # Multi-Item Encoders
+        self.ingredient_encoder = StructuralGroupEncoder(self.embedding, embed_dim, latent_dim)
+        self.action_encoder = ActionSequenceEncoder(self.embedding, embed_dim, latent_dim)
 
-        # 3. Target
+        # Target Title Pipeline (EMA target framework)
         self.target_embedding = copy.deepcopy(self.embedding)
-        self.target_encoder = IngredientEncoder(self.target_embedding, embed_dim, latent_dim)
+        self.target_encoder = TitleTargetEncoder(self.target_embedding, embed_dim, latent_dim)
 
-        # Freeze target parameters
         for param in self.target_embedding.parameters():
             param.requires_grad = False
         for param in self.target_encoder.parameters():
             param.requires_grad = False
 
-        # 4. Predictor and Normalization components
-        self.predictor = Predictor(latent_dim)  # Assumed to be defined elsewhere
+        self.predictor = Predictor(latent_dim)
         self.delta_norm = nn.LayerNorm(latent_dim)
         self.action_gate = nn.Parameter(torch.tensor([0.1]))
         self.prediction_norm = nn.LayerNorm(latent_dim)
@@ -159,13 +243,13 @@ class RecipeJEPA(nn.Module):
 
     @torch.no_grad()
     def update_target_ema(self, momentum: float = 0.99):
-        # Update Target Encoder Weights
         for target_param, ingredient_param in zip(
             self.target_encoder.parameters(), self.ingredient_encoder.parameters()
         ):
-            target_param.data.mul_(momentum).add_(ingredient_param.data, alpha=1.0 - momentum)
+            # Use skip matching logic on shape changes safely if internal weights differ
+            if target_param.shape == ingredient_param.shape:
+                target_param.data.mul_(momentum).add_(ingredient_param.data, alpha=1.0 - momentum)
 
-        # Update Target Embedding Weights
         for target_embedding_param, embedding_param in zip(
             self.target_embedding.parameters(), self.embedding.parameters()
         ):
@@ -173,27 +257,25 @@ class RecipeJEPA(nn.Module):
 
 
 # =====================================================================
-# 3. LOSS FUNCTION
+# 3. LOSS FUNCTION (VICReg)
 # =====================================================================
 
 
 def vicreg_loss(
-    z_pred: torch.Tensor,
-    z_true: torch.Tensor,
-    z_t: torch.Tensor,  # Raw input embedding: encode_state(x_tokens)
-    sim_coeff: float = 25.0,
-    var_coeff: float = 25.0,
-    cov_coeff: float = 5.0,
-    repel_coeff: float = 15.0,  # Strength of the shortcut penalty
-    threshold: float = 0.25,  # Distance threshold (adjust based on latent space scaling)
-    gamma: float = 1.0,
-    eps: float = 1e-4,
+    z_pred,
+    z_true,
+    z_t,
+    sim_coeff=25.0,
+    var_coeff=25.0,
+    cov_coeff=5.0,
+    repel_coeff=15.0,
+    threshold=0.25,
+    gamma=1.0,
+    eps=1e-4,
 ):
     batch_size, num_features = z_pred.shape
     sim_loss = nn.functional.mse_loss(z_pred, z_true)
 
-    # 2. List Repulsion Penalty (Hinge loss pushing prediction away from raw state)
-    # Measures how far the predictor moved the representation from the ingredient base
     shortcut_distance = torch.mean((z_pred - z_t) ** 2, dim=-1)
     repel_loss = torch.mean(nn.functional.relu(shortcut_distance - threshold))
 
@@ -216,7 +298,7 @@ def vicreg_loss(
 
 
 # =====================================================================
-# 4. TRAINER MODULE (WITH TRAIN/VAL + TENSORBOARD + EARLY STOPPING)
+# 4. TRAINER MODULE
 # =====================================================================
 
 
@@ -241,11 +323,8 @@ class JEPATrainer:
         self.scheduler = scheduler
         self.device = device
         self.output_dir = output_dir
-
         self.writer = SummaryWriter(log_dir=log_dir)
         self.global_step = 0
-
-        # Early Stopping Tracking Parameters
         self.patience = patience
         self.min_delta = min_delta
         self.best_val_sim = float("inf")
@@ -253,10 +332,7 @@ class JEPATrainer:
 
     def train(self, epochs: int):
         os.makedirs(self.output_dir, exist_ok=True)
-        print(f"Beginning JEPA Training Loop (Early Stopping: patience={self.patience}, min_delta={self.min_delta})...")
-
         for epoch in range(epochs):
-            # --- Training Pass ---
             self.model.train()
             train_loss_monitor = [0.0, 0.0, 0.0, 0.0]
 
@@ -272,15 +348,7 @@ class JEPATrainer:
                 with torch.no_grad():
                     true_embed = self.model.encode_target(y_tokens).detach()
 
-                total_loss, sim_loss, std_loss, cov_loss, repel_loss = vicreg_loss(
-                    z_pred=pred_embed, z_true=true_embed, z_t=z_t
-                )
-                sim_train, std_train, cov_train, rep_train = (
-                    sim_loss.item(),
-                    std_loss.item(),
-                    cov_loss.item(),
-                    repel_loss.item(),
-                )
+                total_loss, sim_loss, std_loss, cov_loss, repel_loss = vicreg_loss(pred_embed, true_embed, z_t)
 
                 total_loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
@@ -289,113 +357,76 @@ class JEPATrainer:
 
                 self.model.update_target_ema(momentum=0.99)
 
-                self.writer.add_scalar("Loss/Train_Total_Step", total_loss.item(), self.global_step)
-                self.writer.add_scalar("Loss/Train_SIM_Step", sim_train, self.global_step)
-                self.writer.add_scalar("Loss/Train_STD_Step", std_train, self.global_step)
-                self.writer.add_scalar("Loss/Train_COV_Step", cov_train, self.global_step)
-                self.writer.add_scalar("Loss/Train_Repel_Step", rep_train, self.global_step)
-                self.writer.add_scalar(
-                    "Hyperparameters/Learning_Rate", self.scheduler.get_last_lr()[0], self.global_step
+                sim_loss, std_loss, cov_loss, repel_loss = (
+                    sim_loss.item(),
+                    std_loss.item(),
+                    cov_loss.item(),
+                    repel_loss.item(),
                 )
 
-                train_loss_monitor[0] += sim_train
-                train_loss_monitor[1] += std_train
-                train_loss_monitor[2] += cov_train
-                train_loss_monitor[3] += rep_train
+                train_loss_monitor[0] += sim_loss
+                train_loss_monitor[1] += std_loss
+                train_loss_monitor[2] += cov_loss
+                train_loss_monitor[3] += repel_loss
+
                 self.global_step += 1
 
-                if (batch_idx + 1) % 10 == 0 or batch_idx == 0:
+                if batch_idx % 100 == 0:
                     print(
-                        f"Epoch {epoch + 1:02d} |",
-                        f"Train Batch {batch_idx + 1}/{len(self.train_loader)} |",
-                        f"SIM: {sim_train:.4f} |",
-                        f"STD: {std_train:.4f} |",
-                        f"COV: {cov_train:.4f} |",
-                        f"REP: {rep_train:.4f}",
+                        f"Batch: {batch_idx}/{len(self.train_loader)} |",
+                        f"SIM: {sim_loss:.4f} |",
+                        f"STD: {std_loss:.4f} |",
+                        f"COV: {cov_loss:.4f} |",
+                        f"REPEL: {repel_loss:.4f}",
                     )
 
-                if self.device.type == "mps":
-                    torch.mps.empty_cache()
-
-            # Train Epoch Metrics Evaluation
             epoch_train_sim = train_loss_monitor[0] / len(self.train_loader)
             epoch_train_std = train_loss_monitor[1] / len(self.train_loader)
             epoch_train_cov = train_loss_monitor[2] / len(self.train_loader)
             epoch_train_rep = train_loss_monitor[3] / len(self.train_loader)
-
-            # --- Validation Pass ---
             epoch_val_sim, epoch_val_std, epoch_val_cov, epoch_val_rep = self.validate()
 
-            # TensorBoard Logging
-            self.writer.add_scalars("Epoch/Invariance_SIM", {"train": epoch_train_sim, "val": epoch_val_sim}, epoch)
-            self.writer.add_scalars("Epoch/Variance_STD", {"train": epoch_train_std, "val": epoch_val_std}, epoch)
-            self.writer.add_scalars("Epoch/Covariance_COV", {"train": epoch_train_cov, "val": epoch_val_cov}, epoch)
-            self.writer.add_scalars("Epoch/Repulsion", {"train": epoch_train_rep, "val": epoch_val_rep}, epoch)
-
-            print(f"--- Epoch {epoch + 1} Summary ---")
             print(
-                f" [TRAIN] Mean SIM: {epoch_train_sim:.4f} |",
-                f"Mean STD: {epoch_train_std:.4f} |",
-                f"Mean COV: {epoch_train_cov:.4f} |",
-                f"Mean REP: {epoch_train_rep:.4f}",
+                f"Epoch {epoch + 1:02d} |",
+                f"Train SIM: {epoch_train_sim:.4f} |",
+                f"STD: {epoch_train_std:.4f} |",
+                f"COV: {epoch_train_cov:.4f} |",
+                f"REP: {epoch_train_rep:.4f}",
             )
             print(
-                f" [VAL]   Mean SIM: {epoch_val_sim:.4f} |",
-                f"Mean STD: {epoch_val_std:.4f} |",
-                f"Mean COV: {epoch_val_cov:.4f} |",
-                f"Mean REP: {epoch_val_rep:.4f}",
+                f"Epoch {epoch + 1:02d} |",
+                f"Val SIM: {epoch_val_sim:.4f} |",
+                f"STD: {epoch_val_std:.4f} |",
+                f"COV: {epoch_val_cov:.4f} |",
+                f"REP: {epoch_val_rep:.4f}",
             )
 
-            # --- Early Stopping Evaluation ---
-            # Using SIM (Invariance / Prediction accuracy) as our core target metric
             if epoch_val_sim < (self.best_val_sim - self.min_delta):
-                print(
-                    f" [✓] Val SIM improved from {self.best_val_sim:.4f} to {epoch_val_sim:.4f}.",
-                    "Model checkpoint recipe_jepa_model_best.pt written.",
-                )
                 self.best_val_sim = epoch_val_sim
                 self.patience_counter = 0
-                # Always preserve the ultimate generalized configuration state
                 torch.save(self.model.state_dict(), os.path.join(self.output_dir, "recipe_jepa_model_best.pt"))
             else:
                 self.patience_counter += 1
-                print(
-                    " [!] No significant validation improvement.",
-                    f"Early stopping counter: {self.patience_counter}/{self.patience}",
-                )
-
-            # Optional regular checkpoint generation
-            torch.save(self.model.state_dict(), os.path.join(self.output_dir, f"recipe_jepa_model_epoch_{epoch}.pt"))
 
             if self.patience_counter >= self.patience:
-                print(f"\n[🛑] Early stopping triggered! Halting at epoch {epoch + 1} to prevent further overfitting.")
+                print("[🛑] Early stopping triggered.")
                 break
-
         self.writer.close()
-        print(f"Training exit complete. Best Validation SIM Score achieved: {self.best_val_sim:.4f}")
 
     @torch.no_grad()
     def validate(self):
         self.model.eval()
         val_loss_monitor = [0.0, 0.0, 0.0, 0.0]
-
         for x_tokens, a_tokens, y_tokens in self.val_loader:
             x_tokens, a_tokens, y_tokens = x_tokens.to(self.device), a_tokens.to(self.device), y_tokens.to(self.device)
             pred_embed, z_t = self.model(x_tokens, a_tokens)
             true_embed = self.model.encode_target(y_tokens).detach()
-
             _, sim_loss, std_loss, cov_loss, rep_loss = vicreg_loss(pred_embed, true_embed, z_t)
-
             val_loss_monitor[0] += sim_loss.item()
             val_loss_monitor[1] += std_loss.item()
             val_loss_monitor[2] += cov_loss.item()
             val_loss_monitor[3] += rep_loss.item()
-
-        val_sim = val_loss_monitor[0] / len(self.val_loader)
-        val_std = val_loss_monitor[1] / len(self.val_loader)
-        val_cov = val_loss_monitor[2] / len(self.val_loader)
-        val_rep = val_loss_monitor[3] / len(self.val_loader)
-        return val_sim, val_std, val_cov, val_rep
+        return [v / len(self.val_loader) for v in val_loss_monitor]
 
 
 # =====================================================================
@@ -404,11 +435,15 @@ class JEPATrainer:
 
 
 def handle_train(args, device):
-    train_dataset = PreTokenizedActionDataset(args.train_dataset, max_len=128)
-    val_dataset = PreTokenizedActionDataset(args.val_dataset, max_len=128)
+    train_dataset = PreTokenizedActionDataset(args.train_dataset)
+    val_dataset = PreTokenizedActionDataset(args.val_dataset)
 
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, drop_last=True)
-    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, drop_last=True)
+    train_loader = DataLoader(
+        train_dataset, batch_size=args.batch_size, shuffle=True, drop_last=True, collate_fn=jepa_collate_fn
+    )
+    val_loader = DataLoader(
+        val_dataset, batch_size=args.batch_size, shuffle=False, drop_last=True, collate_fn=jepa_collate_fn
+    )
 
     model = RecipeJEPA(vocab_size=30522, embed_dim=384, latent_dim=256).to(device)
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=1e-2)
@@ -423,18 +458,17 @@ def handle_train(args, device):
         return 0.1 + 0.9 * 0.5 * (1.0 + math.cos(math.pi * progress))
 
     scheduler = LambdaLR(optimizer, lr_lambda)
-
     trainer = JEPATrainer(
-        model=model,
-        train_loader=train_loader,
-        val_loader=val_loader,
-        optimizer=optimizer,
-        scheduler=scheduler,
-        device=device,
-        output_dir=args.output_dir,
-        log_dir=args.log_dir,
-        patience=args.patience,
-        min_delta=args.min_delta,
+        model,
+        train_loader,
+        val_loader,
+        optimizer,
+        scheduler,
+        device,
+        args.output_dir,
+        args.log_dir,
+        args.patience,
+        args.min_delta,
     )
     trainer.train(epochs=args.epochs)
 
@@ -447,27 +481,31 @@ def handle_inference(args, device):
         return
 
     tokenizer = AutoTokenizer.from_pretrained("sentence-transformers/all-MiniLM-L6-v2")
-
     model = RecipeJEPA(vocab_size=30522, embed_dim=384, latent_dim=256)
     checkpoint = torch.load(args.checkpoint, map_location=device)
     model.load_state_dict(checkpoint if "state_dict" not in checkpoint else checkpoint["state_dict"])
     model.to(device).eval()
 
     with torch.no_grad():
-        x_enc = tokenizer(args.ingredients, max_length=128, padding="max_length", truncation=True, return_tensors="pt")
-        x_tokens = x_enc["input_ids"].to(device)
+        # Clean list string extraction parsing logic to match 3D format layout
+        def tokenize_to_3d_input(text_input):
+            try:
+                lst = json.loads(text_input) if "[" in text_input else [text_input]
+            except Exception:
+                lst = [text_input]
+            tokens_list = [torch.tensor(tokenizer(item, add_special_tokens=False)["input_ids"]) for item in lst]
+            return pad_nested_sequences([tokens_list], max_len=128).to(device)
 
-        a_enc = tokenizer(args.action, max_length=128, padding="max_length", truncation=True, return_tensors="pt")
-        a_tokens = a_enc["input_ids"].to(device)
+        x_tokens = tokenize_to_3d_input(args.ingredients)
+        a_tokens = tokenize_to_3d_input(args.action)
 
         pred_z_next, _ = model(x_tokens, a_tokens)
-        # pred_z_next = nn.functional.normalize(pred_z_next, p=2, dim=-1)
 
+        # Tokenize targets array using standard flat 2D strategy
         y_enc = tokenizer(targets_list, max_length=128, padding="max_length", truncation=True, return_tensors="pt")
         y_tokens_batch = y_enc["input_ids"].to(device)
 
-        true_z_next_batch = model.encode_ingredients(y_tokens_batch)
-        # true_z_next_batch = nn.functional.normalize(true_z_next_batch, p=2, dim=-1)
+        true_z_next_batch = model.encode_target(y_tokens_batch)
 
         rankings = []
         for idx, target_str in enumerate(targets_list):
@@ -486,44 +524,33 @@ def handle_inference(args, device):
     print("=" * 60)
 
 
-# =====================================================================
-# 6. ENTRYPOINT MAIN
-# =====================================================================
-
-
 def main():
     parser = argparse.ArgumentParser(description="Recipe JEPA Unified CLI Workflow")
     subparsers = parser.add_subparsers(dest="command", required=True, help="Workflow Mode")
 
-    # Train Subcommand
-    train_parser = subparsers.add_parser("train", help="Run model training loop with validation checks")
+    train_parser = subparsers.add_parser("train", help="Run model training loop")
     train_parser.add_argument("--train_dataset", type=str, default="data/recipe_train.parquet")
     train_parser.add_argument("--val_dataset", type=str, default="data/recipe_val.parquet")
     train_parser.add_argument("--output_dir", type=str, default="checkpoints")
     train_parser.add_argument("--log_dir", type=str, default="runs/recipe_jepa_experiment")
-    train_parser.add_argument("--batch_size", type=int, default=8)
+    train_parser.add_argument("--batch_size", type=int, default=64)
     train_parser.add_argument("--epochs", type=int, default=50)
     train_parser.add_argument("--lr", type=float, default=2e-4)
-    train_parser.add_argument("--patience", type=int, default=3, help="Number of epochs to wait before stopping")
-    train_parser.add_argument(
-        "--min_delta", type=float, default=1e-4, help="Minimum improvement required to reset patience"
-    )
+    train_parser.add_argument("--patience", type=int, default=3)
+    train_parser.add_argument("--min_delta", type=float, default=1e-4)
 
-    # Inference Subcommand
-    infer_parser = subparsers.add_parser("inference", help="Run evaluation/prediction inference")
-    infer_parser.add_argument("--checkpoint", type=str, required=True, help="Path to model checkpoint")
-    infer_parser.add_argument("--ingredients", type=str, required=True, help="Starting context string")
-    infer_parser.add_argument("--action", type=str, required=True, help="Action execution string")
-    infer_parser.add_argument(
-        "--targets", type=str, required=True, help="String list representation of target outcomes"
-    )
+    infer_parser = subparsers.add_parser("inference", help="Run prediction inference")
+    infer_parser.add_argument("--checkpoint", type=str, required=True)
+    infer_parser.add_argument("--ingredients", type=str, required=True)
+    infer_parser.add_argument("--action", type=str, required=True)
+    infer_parser.add_argument("--targets", type=str, required=True)
 
     args = parser.parse_args()
 
-    if torch.backends.mps.is_available():
-        device = torch.device("mps")
-    elif torch.cuda.is_available():
+    if torch.cuda.is_available():
         device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
     else:
         device = torch.device("cpu")
     print(f"Using runtime device: {device}")
