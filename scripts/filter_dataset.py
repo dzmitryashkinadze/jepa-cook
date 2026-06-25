@@ -1,3 +1,5 @@
+import json
+
 import polars as pl
 from transformers import AutoTokenizer
 
@@ -21,20 +23,82 @@ tokenizer = AutoTokenizer.from_pretrained("sentence-transformers/all-MiniLM-L6-v
 MAX_TOKENS = 128
 
 
-def encode_and_pad(series: pl.Series) -> pl.Series:
-    texts = series.to_list()
-    tokenized = tokenizer(texts, max_length=MAX_TOKENS, truncation=True, add_special_tokens=True)["input_ids"]
-    return pl.Series([" ".join(map(str, tokens)) for tokens in tokenized], dtype=pl.String)
+def encode_json_list(series: pl.Series) -> pl.Series:
+    """Parses JSON-string arrays and tokenizes each element individually.
+
+    Yields a nested List(List(Int64)) per row.
+    """
+    rows = series.to_list()
+    nested_token_ids = []
+
+    for row in rows:
+        if row is None:
+            nested_token_ids.append([])
+            continue
+
+        row_str = str(row).strip()
+        try:
+            items = json.loads(row_str)
+            if not isinstance(items, list):
+                items = [str(items)]
+        except (json.JSONDecodeError, TypeError):
+            items = [row_str] if row_str else []
+
+        items = [str(item) for item in items if item is not None]
+
+        if not items:
+            nested_token_ids.append([])
+            continue
+
+        tokenized_batch = tokenizer(
+            items,
+            max_length=MAX_TOKENS,
+            truncation=True,
+            add_special_tokens=False,
+        )["input_ids"]
+
+        nested_token_ids.append(tokenized_batch)
+
+    return pl.Series(nested_token_ids, dtype=pl.List(pl.List(pl.Int64)))
+
+
+def encode_single_string(series: pl.Series) -> pl.Series:
+    """Tokenizes a standard flat text field (e.g. Title).
+
+    Yields a single List(Int64) per row.
+    """
+    texts = [str(t) if t is not None else "" for t in series.to_list()]
+
+    # Process as a single batch over the column rows
+    tokenized = tokenizer(
+        texts,
+        max_length=MAX_TOKENS,
+        truncation=True,
+        add_special_tokens=True,  # Keeps [CLS]/[SEP] wrapper tokens for the target title text
+    )["input_ids"]
+
+    return pl.Series(tokenized, dtype=pl.List(pl.Int64))
 
 
 def check_token_length(series: pl.Series) -> pl.Series:
     texts = series.to_list()
-    tokenized = tokenizer(texts, truncation=False, add_special_tokens=True)["input_ids"]
+    tokenized = tokenizer(texts, max_length=512, truncation=True, add_special_tokens=True)["input_ids"]
     return pl.Series([len(tokens) <= MAX_TOKENS for tokens in tokenized], dtype=pl.Boolean)
 
 
 def extract_action_context(series: pl.Series) -> pl.Series:
-    return series.str.split(" ").list.slice(0, 4).list.join(" ")
+    def get_first_step(val):
+        if not val:
+            return ""
+        try:
+            lst = json.loads(val)
+            if isinstance(lst, list) and len(lst) > 0:
+                return " ".join(str(lst[0]).split()[:4])
+        except Exception:
+            pass
+        return " ".join(str(val).split()[:4])
+
+    return series.map_elements(get_first_step, return_dtype=pl.String)
 
 
 print("Streaming and building pre-tokenized target blocks...")
@@ -51,15 +115,13 @@ data_sampled = (
     .collect()
     .sample(fraction=1.0, shuffle=True, seed=42)
     .limit(20000)
-    .with_columns([
-        # Generate an action proxy from the first few words of the directions
-        pl.col("directions").map_batches(extract_action_context).alias("action_text")
-    ])
+    .with_columns([pl.col("directions").map_batches(extract_action_context).alias("action_text")])
 )
 
 # ==============================================================================
 # Synthetic State-Action-State Triples Block
 # ==============================================================================
+# Swapped 'directions' for 'title' to mirror your explicit goal
 triples_raw = [
     # --- COOK (General Heat / Simmer / Steam) ---
     {"ingredients": "pasta water", "action_text": "cook", "directions": "cooked al dente pasta"},
@@ -134,40 +196,36 @@ triples_raw = [
 ]
 
 synthetic_df = pl.DataFrame(
-    triples_raw, schema={"ingredients": pl.String, "action_text": pl.String, "directions": pl.String}
+    triples_raw, schema={"ingredients": pl.String, "action_text": pl.String, "title": pl.String}
 )
 
-data_sampled = data_sampled.select(["ingredients", "action_text", "directions"])
-synthetic_df = synthetic_df.select(["ingredients", "action_text", "directions"])
+# Pull the real 'title' along instead of 'directions' now
+data_sampled = data_sampled.select(["ingredients", "action_text", "title"])
+synthetic_df = synthetic_df.select(["ingredients", "action_text", "title"])
 
 # Append foundational knowledge triples
 data_sampled = data_sampled.vstack(synthetic_df)
 data_sampled.write_csv("data/recipe_sampled.csv")
 
-# Tokenize across all data parts
+# Tokenize structural subsets vs simple string text mapping
 data_sampled = data_sampled.with_columns([
-    pl.col("ingredients").map_batches(encode_and_pad).alias("x_tokens"),
-    pl.col("action_text").map_batches(encode_and_pad).alias("a_tokens"),
-    pl.col("directions").map_batches(encode_and_pad).alias("y_tokens"),
+    pl.col("ingredients").map_batches(encode_json_list).alias("x_tokens"),
+    pl.col("action_text").map_batches(encode_json_list).alias("a_tokens"),
+    pl.col("title").map_batches(encode_single_string).alias("y_tokens"),  # <-- Yields flat list of tokens
 ])
 
 # Complete dataset containing the token columns
 tokenized_df = data_sampled.select(["x_tokens", "a_tokens", "y_tokens"])
 
-# Reshuffle now so synthetic data is thoroughly spread between both sets
+# Reshuffle and export
 shuffled_df = tokenized_df.sample(fraction=1.0, shuffle=True, seed=42)
-
 total_rows = len(shuffled_df)
 train_size = int(total_rows * 0.8)
 
 train_df = shuffled_df.slice(0, train_size)
 val_df = shuffled_df.slice(train_size, total_rows - train_size)
 
-# Output splits out as individual parquet files
 train_df.write_parquet("data/recipe_train.parquet")
 val_df.write_parquet("data/recipe_val.parquet")
 
-print("Done! Splitting sequence execution completed successfully.")
-print(f" -> Total processed dataset: {total_rows} records.")
-print(f" -> Training fold:           {len(train_df)} rows saved to data/recipe_train.parquet")
-print(f" -> Validation fold:         {len(val_df)} rows saved to data/recipe_val.parquet")
+print("Done! Processing execution completed successfully.")
