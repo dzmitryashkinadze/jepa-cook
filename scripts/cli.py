@@ -158,12 +158,24 @@ def vicreg_loss(
 
 
 # =====================================================================
-# 3. TRAINER MODULE (WITH TRAIN/VAL + TENSORBOARD)
+# 3. TRAINER MODULE (WITH TRAIN/VAL + TENSORBOARD + EARLY STOPPING)
 # =====================================================================
 
 
 class JEPATrainer:
-    def __init__(self, model, train_loader, val_loader, optimizer, scheduler, device, output_dir, log_dir):
+    def __init__(
+        self,
+        model,
+        train_loader,
+        val_loader,
+        optimizer,
+        scheduler,
+        device,
+        output_dir,
+        log_dir,
+        patience=5,
+        min_delta=0.001,
+    ):
         self.model = model
         self.train_loader = train_loader
         self.val_loader = val_loader
@@ -175,9 +187,15 @@ class JEPATrainer:
         self.writer = SummaryWriter(log_dir=log_dir)
         self.global_step = 0
 
+        # Early Stopping Tracking Parameters
+        self.patience = patience
+        self.min_delta = min_delta
+        self.best_val_sim = float("inf")
+        self.patience_counter = 0
+
     def train(self, epochs: int):
         os.makedirs(self.output_dir, exist_ok=True)
-        print("Beginning Action-Conditioned JEPA Training via JEPATrainer...")
+        print(f"Beginning JEPA Training Loop (Early Stopping: patience={self.patience}, min_delta={self.min_delta})...")
 
         for epoch in range(epochs):
             # --- Training Pass ---
@@ -206,7 +224,6 @@ class JEPATrainer:
 
                 self.model.update_target_ema(momentum=0.999)
 
-                # Step-level telemetry logs (Train Only)
                 self.writer.add_scalar("Loss/Train_Total_Step", total_loss.item(), self.global_step)
                 self.writer.add_scalar("Loss/Train_SIM_Step", sim_val, self.global_step)
                 self.writer.add_scalar("Loss/Train_STD_Step", std_val, self.global_step)
@@ -222,8 +239,9 @@ class JEPATrainer:
 
                 if (batch_idx + 1) % 10 == 0 or batch_idx == 0:
                     print(
-                        f"Epoch {epoch + 1:02d} | Train Batch {batch_idx + 1}/{len(self.train_loader)} | "
-                        f"SIM: {sim_val:.4f} | STD: {std_val:.4f} | COV: {cov_val:.4f}"
+                        f"Epoch {epoch + 1:02d} |",
+                        f"Train Batch {batch_idx + 1}/{len(self.train_loader)} |",
+                        f"SIM: {sim_val:.4f}",
                     )
 
                 if self.device.type == "mps":
@@ -237,12 +255,12 @@ class JEPATrainer:
             # --- Validation Pass ---
             epoch_val_sim, epoch_val_std, epoch_val_cov = self.validate()
 
-            # TensorBoard Side-by-Side Evaluation Logging
+            # TensorBoard Logging
             self.writer.add_scalars("Epoch/Invariance_SIM", {"train": epoch_train_sim, "val": epoch_val_sim}, epoch)
             self.writer.add_scalars("Epoch/Variance_STD", {"train": epoch_train_std, "val": epoch_val_std}, epoch)
             self.writer.add_scalars("Epoch/Covariance_COV", {"train": epoch_train_cov, "val": epoch_val_cov}, epoch)
 
-            print(f"--- Epoch {epoch + 1} End ---")
+            print(f"--- Epoch {epoch + 1} Summary ---")
             print(
                 f" [TRAIN] Mean SIM: {epoch_train_sim:.4f} |",
                 f"Mean STD: {epoch_train_std:.4f} |",
@@ -254,11 +272,30 @@ class JEPATrainer:
                 f"Mean COV: {epoch_val_cov:.4f}",
             )
 
-            torch.save(self.model.state_dict(), os.path.join(self.output_dir, f"recipe_jepa_model_{epoch}.pt"))
+            # --- Early Stopping Evaluation ---
+            # Using SIM (Invariance / Prediction accuracy) as our core target metric
+            if epoch_val_sim < (self.best_val_sim - self.min_delta):
+                print(f" [✓] Val SIM improved from {self.best_val_sim:.4f} to {epoch_val_sim:.4f}.")
+                self.best_val_sim = epoch_val_sim
+                self.patience_counter = 0
+                # Always preserve the ultimate generalized configuration state
+                torch.save(self.model.state_dict(), os.path.join(self.output_dir, "recipe_jepa_model_best.pt"))
+            else:
+                self.patience_counter += 1
+                print(
+                    " [!] No significant validation improvement.",
+                    f"Early stopping counter: {self.patience_counter}/{self.patience}",
+                )
 
-        torch.save(self.model.state_dict(), os.path.join(self.output_dir, "recipe_jepa_model_final.pt"))
+            # Optional regular checkpoint generation
+            torch.save(self.model.state_dict(), os.path.join(self.output_dir, f"recipe_jepa_model_epoch_{epoch}.pt"))
+
+            if self.patience_counter >= self.patience:
+                print(f"\n[🛑] Early stopping triggered! Halting at epoch {epoch + 1} to prevent further overfitting.")
+                break
+
         self.writer.close()
-        print("Training run complete. Run details captured securely.")
+        print(f"Training exit complete. Best Validation SIM Score achieved: {self.best_val_sim:.4f}")
 
     @torch.no_grad()
     def validate(self):
@@ -267,7 +304,6 @@ class JEPATrainer:
 
         for x_tokens, a_tokens, y_tokens in self.val_loader:
             x_tokens, a_tokens, y_tokens = x_tokens.to(self.device), a_tokens.to(self.device), y_tokens.to(self.device)
-
             pred_embed = self.model(x_tokens, a_tokens)
             true_embed = self.model.encode_target(y_tokens).detach()
 
@@ -289,7 +325,6 @@ class JEPATrainer:
 
 
 def handle_train(args, device):
-    # Setup split files generated by dataset script
     train_dataset = PreTokenizedActionDataset(args.train_dataset, max_len=128)
     val_dataset = PreTokenizedActionDataset(args.val_dataset, max_len=128)
 
@@ -319,6 +354,8 @@ def handle_train(args, device):
         device=device,
         output_dir=args.output_dir,
         log_dir=args.log_dir,
+        patience=args.patience,
+        min_delta=args.min_delta,
     )
     trainer.train(epochs=args.epochs)
 
@@ -380,18 +417,19 @@ def main():
     subparsers = parser.add_subparsers(dest="command", required=True, help="Workflow Mode")
 
     # Train Subcommand
-    train_parser = subparsers.add_parser("train", help="Run model training loop with validation mapping")
-    train_parser.add_argument(
-        "--train_dataset", type=str, default="data/recipe_train.parquet", help="Path to training Parquet fold"
-    )
-    train_parser.add_argument(
-        "--val_dataset", type=str, default="data/recipe_val.parquet", help="Path to validation Parquet fold"
-    )
+    train_parser = subparsers.add_parser("train", help="Run model training loop with validation checks")
+    train_parser.add_argument("--train_dataset", type=str, default="data/recipe_train.parquet")
+    train_parser.add_argument("--val_dataset", type=str, default="data/recipe_val.parquet")
     train_parser.add_argument("--output_dir", type=str, default="checkpoints")
     train_parser.add_argument("--log_dir", type=str, default="runs/recipe_jepa_experiment")
     train_parser.add_argument("--batch_size", type=int, default=64)
     train_parser.add_argument("--epochs", type=int, default=50)
-    train_parser.add_argument("--lr", type=float, default=5e-4)
+    train_parser.add_argument("--lr", type=float, default=2e-4)
+    # New CLI Early Stopping Arguments
+    train_parser.add_argument("--patience", type=int, default=3, help="Number of epochs to wait before stopping")
+    train_parser.add_argument(
+        "--min_delta", type=float, default=1e-4, help="Minimum improvement required to reset patience"
+    )
 
     # Inference Subcommand
     infer_parser = subparsers.add_parser("inference", help="Run evaluation/prediction inference")
