@@ -56,7 +56,7 @@ class TransformerPredictor(nn.Module):
         )
         self.transformer_decoder = nn.TransformerDecoder(decoder_layer, num_layers=num_layers)
 
-    def forward(self, z_t: torch.Tensor, u_seq: torch.Tensor, a_mask: torch.Tensor = None) -> torch.Tensor:
+    def forward(self, z_t: torch.Tensor, u_seq: torch.Tensor, a_mask: torch.Tensor | None = None) -> torch.Tensor:
         tgt = z_t.unsqueeze(1)
         mem_mask = (a_mask == 0) if a_mask is not None else None
         out = self.transformer_decoder(tgt=tgt, memory=u_seq, memory_key_padding_mask=mem_mask)
@@ -275,7 +275,10 @@ class JEPATrainer:
             # --- Early Stopping Evaluation ---
             # Using SIM (Invariance / Prediction accuracy) as our core target metric
             if epoch_val_sim < (self.best_val_sim - self.min_delta):
-                print(f" [✓] Val SIM improved from {self.best_val_sim:.4f} to {epoch_val_sim:.4f}.")
+                print(
+                    f" [✓] Val SIM improved from {self.best_val_sim:.4f} to {epoch_val_sim:.4f}.",
+                    "Model checkpoint recipe_jepa_model_best.pt written.",
+                )
                 self.best_val_sim = epoch_val_sim
                 self.patience_counter = 0
                 # Always preserve the ultimate generalized configuration state
@@ -422,7 +425,7 @@ def main():
     train_parser.add_argument("--val_dataset", type=str, default="data/recipe_val.parquet")
     train_parser.add_argument("--output_dir", type=str, default="checkpoints")
     train_parser.add_argument("--log_dir", type=str, default="runs/recipe_jepa_experiment")
-    train_parser.add_argument("--batch_size", type=int, default=64)
+    train_parser.add_argument("--batch_size", type=int, default=8)
     train_parser.add_argument("--epochs", type=int, default=50)
     train_parser.add_argument("--lr", type=float, default=2e-4)
     # New CLI Early Stopping Arguments
