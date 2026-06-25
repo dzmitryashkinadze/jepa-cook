@@ -1,0 +1,19 @@
+# Pre-commit configuration
+repos:
+  - repo: local
+    hooks:
+      - id: ruff-check
+        name: Ruff Check
+        entry: uv run ruff check . --fix
+        language: system
+        pass_filenames: false
+      - id: ruff-format
+        name: Ruff Format
+        entry: uv run ruff format .
+        language: system
+        pass_filenames: false
+      - id: deptry
+        name: Deptry
+        entry: uv run deptry .
+        language: system
+        pass_filenames: false

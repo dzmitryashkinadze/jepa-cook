@@ -1,0 +1,19 @@
+[project]
+name = "jepa-cook"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "torch>=2.0",
+  "transformers>=4.30",
+  "polars>=1.41.2",
+]
+
+[dependency-groups]
+dev = [
+    "deptry>=0.25.1",
+    "pre-commit>=4.6.0",
+    "pytest>=9.0.3",
+    "ruff>=0.15.15",
+]
