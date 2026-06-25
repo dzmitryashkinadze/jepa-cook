@@ -12,4 +12,5 @@ wheels/
 
 # data
 data/
+runs/
 checkpoints/

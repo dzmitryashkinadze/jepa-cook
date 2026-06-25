@@ -10,6 +10,7 @@ import torch.nn as nn
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader, Dataset
+from torch.utils.tensorboard import SummaryWriter
 from transformers import AutoTokenizer
 
 # =====================================================================
@@ -55,7 +56,7 @@ class TransformerPredictor(nn.Module):
         )
         self.transformer_decoder = nn.TransformerDecoder(decoder_layer, num_layers=num_layers)
 
-    def forward(self, z_t: torch.Tensor, u_seq: torch.Tensor, a_mask: torch.Tensor = None) -> torch.Tensor:
+    def forward(self, z_t: torch.Tensor, u_seq: torch.Tensor, a_mask: torch.Tensor | None = None) -> torch.Tensor:
         tgt = z_t.unsqueeze(1)
         mem_mask = (a_mask == 0) if a_mask is not None else None
         out = self.transformer_decoder(tgt=tgt, memory=u_seq, memory_key_padding_mask=mem_mask)
@@ -157,12 +158,104 @@ def vicreg_loss(
 
 
 # =====================================================================
-# 3. SUBCOMMAND LOGIC (TRAIN & INFERENCE)
+# 3. TRAINER MODULE (WITH TENSORBOARD)
+# =====================================================================
+
+
+class JEPATrainer:
+    def __init__(self, model, dataloader, optimizer, scheduler, device, output_dir, log_dir):
+        self.model = model
+        self.dataloader = dataloader
+        self.optimizer = optimizer
+        self.scheduler = scheduler
+        self.device = device
+        self.output_dir = output_dir
+
+        # TensorBoard setup
+        self.writer = SummaryWriter(log_dir=log_dir)
+        self.global_step = 0
+
+    def train(self, epochs: int):
+        os.makedirs(self.output_dir, exist_ok=True)
+        print("Beginning Action-Conditioned JEPA Training via JEPATrainer...")
+        self.model.train()
+
+        for epoch in range(epochs):
+            loss_monitor = [0.0, 0.0, 0.0]
+
+            for batch_idx, (x_tokens, a_tokens, y_tokens) in enumerate(self.dataloader):
+                self.optimizer.zero_grad()
+                x_tokens, a_tokens, y_tokens = (
+                    x_tokens.to(self.device),
+                    a_tokens.to(self.device),
+                    y_tokens.to(self.device),
+                )
+
+                pred_embed = self.model(x_tokens, a_tokens)
+                with torch.no_grad():
+                    true_embed = self.model.encode_target(y_tokens).detach()
+
+                total_loss, sim_loss, std_loss, cov_loss = vicreg_loss(pred_embed, true_embed)
+                sim_val, std_val, cov_val = sim_loss.item(), std_loss.item(), cov_loss.item()
+
+                total_loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                self.optimizer.step()
+                self.scheduler.step()
+
+                self.model.update_target_ema(momentum=0.999)
+
+                # Metrics telemetry to TensorBoard
+                self.writer.add_scalar("Loss/Total", total_loss.item(), self.global_step)
+                self.writer.add_scalar("Loss/Invariance_SIM", sim_val, self.global_step)
+                self.writer.add_scalar("Loss/Variance_STD", std_val, self.global_step)
+                self.writer.add_scalar("Loss/Covariance_COV", cov_val, self.global_step)
+                self.writer.add_scalar(
+                    "Hyperparameters/Learning_Rate", self.scheduler.get_last_lr()[0], self.global_step
+                )
+
+                loss_monitor[0] += sim_val
+                loss_monitor[1] += std_val
+                loss_monitor[2] += cov_val
+                self.global_step += 1
+
+                if (batch_idx + 1) % 10 == 0 or batch_idx == 0:
+                    print(
+                        f"Epoch {epoch + 1:02d} | Batch {batch_idx + 1}/{len(self.dataloader)} | "
+                        f"SIM: {sim_val:.4f} | STD: {std_val:.4f} | COV: {cov_val:.4f}"
+                    )
+
+                if self.device.type == "mps":
+                    torch.mps.empty_cache()
+
+            # Epoch summary logging
+            epoch_sim = loss_monitor[0] / len(self.dataloader)
+            epoch_std = loss_monitor[1] / len(self.dataloader)
+            epoch_cov = loss_monitor[2] / len(self.dataloader)
+
+            self.writer.add_scalar("Epoch_Average/SIM", epoch_sim, epoch)
+            self.writer.add_scalar("Epoch_Average/STD", epoch_std, epoch)
+            self.writer.add_scalar("Epoch_Average/COV", epoch_cov, epoch)
+
+            print(
+                f"--- Epoch {epoch + 1} End |",
+                f"Mean SIM: {epoch_sim:.4f} |",
+                f"Mean STD: {epoch_std:.4f} |",
+                f"Mean COV: {epoch_cov:.4f} ---",
+            )
+            torch.save(self.model.state_dict(), os.path.join(self.output_dir, f"recipe_jepa_model_{epoch}.pt"))
+
+        torch.save(self.model.state_dict(), os.path.join(self.output_dir, "recipe_jepa_model_final.pt"))
+        self.writer.close()
+        print("Training run complete. TensorBoard logs stored securely.")
+
+
+# =====================================================================
+# 4. SUBCOMMAND INTERFACES
 # =====================================================================
 
 
 def handle_train(args, device):
-    os.makedirs(args.output_dir, exist_ok=True)
     dataset = PreTokenizedActionDataset(args.dataset_path, max_len=128)
     dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, drop_last=True)
 
@@ -179,57 +272,18 @@ def handle_train(args, device):
         return 0.1 + 0.9 * 0.5 * (1.0 + math.cos(math.pi * progress))
 
     scheduler = LambdaLR(optimizer, lr_lambda)
-    print("Beginning Action-Conditioned JEPA Training Baseline...")
-    model.train()
 
-    for epoch in range(args.epochs):
-        loss_monitor = [0.0, 0.0, 0.0]
-        for batch_idx, (x_tokens, a_tokens, y_tokens) in enumerate(dataloader):
-            optimizer.zero_grad()
-            x_tokens, a_tokens, y_tokens = x_tokens.to(device), a_tokens.to(device), y_tokens.to(device)
-
-            pred_embed = model(x_tokens, a_tokens)
-            with torch.no_grad():
-                true_embed = model.encode_target(y_tokens).detach()
-
-            total_loss, sim_loss, std_loss, cov_loss = vicreg_loss(pred_embed, true_embed)
-            sim_val, std_val, cov_val = sim_loss.item(), std_loss.item(), cov_loss.item()
-
-            total_loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
-            scheduler.step()
-
-            model.update_target_ema(momentum=0.999)
-            loss_monitor[0] += sim_val
-            loss_monitor[1] += std_val
-            loss_monitor[2] += cov_val
-
-            if (batch_idx + 1) % 10 == 0 or batch_idx == 0:
-                print(
-                    f"Epoch {epoch + 1:02d} |",
-                    f"Batch {batch_idx + 1}/{len(dataloader)} |",
-                    f"SIM: {sim_val:.4f} |",
-                    f"STD: {std_val:.4f} |",
-                    f"COV: {cov_val:.4f}",
-                )
-
-            if device.type == "mps":
-                torch.mps.empty_cache()
-
-        epoch_sim = loss_monitor[0] / len(dataloader)
-        epoch_std = loss_monitor[1] / len(dataloader)
-        epoch_cov = loss_monitor[2] / len(dataloader)
-        print(
-            f"--- Epoch {epoch + 1} End |",
-            f"Mean SIM: {epoch_sim:.4f} |",
-            f"Mean STD: {epoch_std:.4f} |",
-            f"Mean COV: {epoch_cov:.4f} ---",
-        )
-        torch.save(model.state_dict(), os.path.join(args.output_dir, f"recipe_jepa_model_{epoch}.pt"))
-
-    torch.save(model.state_dict(), os.path.join(args.output_dir, "recipe_jepa_model_final.pt"))
-    print("Training run complete.")
+    # Instantiate the new wrapper trainer
+    trainer = JEPATrainer(
+        model=model,
+        dataloader=dataloader,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        device=device,
+        output_dir=args.output_dir,
+        log_dir=args.log_dir,
+    )
+    trainer.train(epochs=args.epochs)
 
 
 def handle_inference(args, device):
@@ -280,7 +334,7 @@ def handle_inference(args, device):
 
 
 # =====================================================================
-# 4. ENTRYPOINT MAIN
+# 5. ENTRYPOINT MAIN
 # =====================================================================
 
 
@@ -292,6 +346,7 @@ def main():
     train_parser = subparsers.add_parser("train", help="Run model training loop")
     train_parser.add_argument("--dataset_path", type=str, default="data/recipe_sampled.parquet")
     train_parser.add_argument("--output_dir", type=str, default="checkpoints")
+    train_parser.add_argument("--log_dir", type=str, default="runs/recipe_jepa_experiment")
     train_parser.add_argument("--batch_size", type=int, default=64)
     train_parser.add_argument("--epochs", type=int, default=50)
     train_parser.add_argument("--lr", type=float, default=5e-4)
@@ -307,7 +362,6 @@ def main():
 
     args = parser.parse_args()
 
-    # Hardware selector logic
     if torch.backends.mps.is_available():
         device = torch.device("mps")
     elif torch.cuda.is_available():
