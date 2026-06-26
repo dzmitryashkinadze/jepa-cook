@@ -1,0 +1,30 @@
+model:
+  vocab_size: 30522
+  embed_dim: 384
+  latent_dim: 256
+  max_len: 128
+  nhead: 8
+  num_layers: 2
+  ema_momentum: 0.999
+
+loss:
+  sim_weight: 1.0
+  var_weight: 25.0
+  cov_weight: 5.0
+  hinge_epsilon: 0.0001
+
+train:
+  train_dataset: "data/recipe_train.parquet"
+  val_dataset: "data/recipe_val.parquet"
+  output_dir: "checkpoints"
+  log_dir: "runs/recipe_jepa_experiment"
+  batch_size: 16
+  epochs: 50
+  lr: 0.0002
+  weight_decay: 0.01
+  patience: 3
+  min_delta: 0.0001
+  clip_grad_norm: 1.0
+
+inference:
+  tokenizer_name: "sentence-transformers/all-MiniLM-L6-v2"
