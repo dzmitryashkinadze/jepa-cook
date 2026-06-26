@@ -91,7 +91,7 @@ class Embedding(nn.Module):
 class StructuralGroupEncoder(nn.Module):
     """Encodes a nested 3D tensor of multiple item components into a singular joint latent vector."""
 
-    def __init__(self, embedding_layer: Embedding, embed_dim: int, latent_dim: int):
+    def __init__(self, embedding_layer: nn.Module, embed_dim: int, latent_dim: int):
         super().__init__()
         self.embedding_layer = embedding_layer
 
@@ -101,12 +101,14 @@ class StructuralGroupEncoder(nn.Module):
             nn.Linear(latent_dim, latent_dim), nn.LayerNorm(latent_dim), nn.GELU(), nn.Linear(latent_dim, latent_dim)
         )
 
-    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+    def forward(self, tokens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         # tokens shape: [batch_size, num_elements, max_len]
         batch_size, num_elements, max_len = tokens.shape
 
-        # 1. Flatten for uniform embedding step evaluation
+        # 1. Flatten for uniform embedding evaluations
         flat_tokens = tokens.view(-1, max_len)  # [B * N, L]
+
+        # Look for valid tokens (not equal to pad_token_id 0)
         mask = (flat_tokens != 0).float()
         mask_counts = mask.sum(dim=1, keepdim=True).clamp(min=1.0)
 
@@ -117,23 +119,25 @@ class StructuralGroupEncoder(nn.Module):
         pooled_elements = masked_embeddings.sum(dim=1) / mask_counts  # [B * N, D]
         element_latents = self.element_compressor(pooled_elements)  # [B * N, H]
 
-        # 2. Re-assemble to row segments structures
+        # 2. Re-assemble back to structured batch layout
         group_latents = element_latents.view(batch_size, num_elements, -1)  # [B, N, H]
 
-        # Pool all combined elements across rows safely without dimension pollution
-        group_mask = (tokens.sum(dim=-1) != 0).float()  # [B, N]
+        group_mask = (tokens != 0).any(dim=-1).float()  # [B, N]
         group_counts = group_mask.sum(dim=1, keepdim=True).clamp(min=1.0)  # [B, 1]
 
         masked_group = group_latents * group_mask.unsqueeze(-1)  # [B, N, H]
-        combined_latent = masked_group.sum(dim=1) / group_counts  # [B, H] / [B, 1] -> [B, H]
-
-        return self.joint_projection(combined_latent)
+        # combined_latent = masked_group.sum(dim=1) / group_counts  # [B, H]
+        #
+        # return self.joint_projection(combined_latent), element_latents
+        combined_latent = masked_group.sum(dim=1) / group_counts
+        projected = self.joint_projection(combined_latent)
+        return nn.functional.layer_norm(projected, projected.shape[1:]), element_latents
 
 
 class ActionSequenceEncoder(nn.Module):
     """Generates structural sequence memories from multi-step action groups for predictor decoding."""
 
-    def __init__(self, embedding_layer: Embedding, embed_dim: int, latent_dim: int):
+    def __init__(self, embedding_layer: nn.Module, embed_dim: int, latent_dim: int):
         super().__init__()
         self.embedding_layer = embedding_layer
         self.compressor = nn.Sequential(nn.Linear(embed_dim, latent_dim), nn.LayerNorm(latent_dim), nn.GELU())
@@ -150,10 +154,13 @@ class ActionSequenceEncoder(nn.Module):
         masked_embeddings = embeddings * mask.unsqueeze(-1)
 
         pooled_actions = masked_embeddings.sum(dim=1) / mask_counts
-        u_seq = self.compressor(pooled_actions).view(batch_size, num_actions, -1)  # [B, N, H]
+        # u_seq = self.compressor(pooled_actions).view(batch_size, num_actions, -1)  # [B, N, H]
+        #
+        a_mask = (a_tokens == 0).all(dim=-1)
+        # return u_seq, a_mask
 
-        # Action sequence mask profile evaluation
-        a_mask = (a_tokens.sum(dim=-1) != 0).float()  # [B, N]
+        u_seq = self.compressor(pooled_actions).view(batch_size, num_actions, -1)
+        u_seq = nn.functional.layer_norm(u_seq, u_seq.shape[2:])  # Scale bound sequence dimensions
         return u_seq, a_mask
 
 
@@ -231,18 +238,19 @@ class RecipeJEPA(nn.Module):
         with torch.no_grad():
             return self.target_encoder(tokens)
 
-    def forward(self, x_tokens: torch.Tensor, a_tokens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        z_t = self.encode_ingredients(x_tokens)
+    def forward(self, x_tokens, a_tokens):
+        # Get intermediate structures and final pooled representation
+        z_t, element_latents = self.ingredient_encoder(x_tokens)
         u_seq, a_mask = self.action_encoder(a_tokens)
 
-        latent_delta = self.predictor(z_t, u_seq, a_mask)
-        normalized_delta = self.delta_norm(latent_delta)
+        # Predictor step
+        pred_embed = self.predictor(z_t, u_seq, a_mask)
 
-        z_next_pred = self.prediction_norm(z_t + self.action_gate * normalized_delta)
-        return z_next_pred, z_t
+        # Return everything needed for the VICReg computation
+        return pred_embed, z_t, element_latents, u_seq
 
     @torch.no_grad()
-    def update_target_ema(self, momentum: float = 0.99):
+    def update_target_ema(self, momentum: float = 0.999):
         for target_param, ingredient_param in zip(
             self.target_encoder.parameters(), self.ingredient_encoder.parameters()
         ):
@@ -261,40 +269,64 @@ class RecipeJEPA(nn.Module):
 # =====================================================================
 
 
-def vicreg_loss(
-    z_pred,
-    z_true,
-    z_t,
-    sim_coeff=25.0,
-    var_coeff=25.0,
-    cov_coeff=5.0,
-    repel_coeff=15.0,
-    threshold=0.25,
-    gamma=1.0,
-    eps=1e-4,
-):
-    batch_size, num_features = z_pred.shape
-    sim_loss = nn.functional.mse_loss(z_pred, z_true)
+class FullVicregLoss(nn.Module):
+    def __init__(self, sim_weight=1.0, var_weight=25.0, cov_weight=5.0, hinge_epsilon=1e-4):
+        super().__init__()
+        self.sim_weight = sim_weight
+        self.var_weight = var_weight
+        self.cov_weight = cov_weight
+        self.eps = hinge_epsilon
 
-    shortcut_distance = torch.mean((z_pred - z_t) ** 2, dim=-1)
-    repel_loss = torch.mean(nn.functional.relu(shortcut_distance - threshold))
+    def forward(self, pred_embed, target_embed, ind_ingr, pooled_ingr, action_seq):
+        """
+        Args:
+            pred_embed:   [B, H]  - Predictor output layer
+            target_embed: [B, H]  - Ground truth future state latent
+            ind_ingr:     [B, N, H] - Individual ingredient embeddings
+            pooled_ingr:  [B, H]  - Fully pooled ingredient representation
+            action_seq:   [B, A, H] - Sequential action embeddings
+        """
+        # 0. Core JEPA Similarity Loss (MSE)
+        sim_loss = nn.functional.mse_loss(pred_embed, target_embed)
 
-    std_a = torch.sqrt(z_pred.var(dim=0) + eps)
-    std_b = torch.sqrt(z_true.var(dim=0) + eps)
-    var_loss_a = torch.mean(nn.functional.relu(gamma - std_a))
-    var_loss_b = torch.mean(nn.functional.relu(gamma - std_b))
-    std_loss = var_loss_a + var_loss_b
+        # 1 & 2: Calculate Variance Losses (Hinge Loss against target std of 1.0)
+        # We flatten spatial dimensions [B, N, H] -> [B * N, H] to compute variance over instances
+        var_ind_ingr = self._variance_loss(ind_ingr.view(-1, ind_ingr.size(-1)))
+        var_pool_ingr = self._variance_loss(pooled_ingr)
+        var_actions = self._variance_loss(action_seq.view(-1, action_seq.size(-1)))
 
-    z_pred_zero_mean = z_pred - z_pred.mean(dim=0)
-    z_true_zero_mean = z_true - z_true.mean(dim=0)
-    cov_a = (z_pred_zero_mean.T @ z_pred_zero_mean) / (batch_size - 1)
-    cov_b = (z_true_zero_mean.T @ z_true_zero_mean) / (batch_size - 1)
-    cov_loss_a = cov_a.pow(2).sum() - cov_a.diagonal().pow(2).sum()
-    cov_loss_b = cov_b.pow(2).sum() - cov_b.diagonal().pow(2).sum()
-    cov_loss = (cov_loss_a + cov_loss_b) / num_features
+        total_var_loss = (var_ind_ingr + var_pool_ingr + var_actions) / 3.0
 
-    total_loss = (sim_coeff * sim_loss) + (var_coeff * std_loss) + (cov_coeff * cov_loss) + (repel_coeff * repel_loss)
-    return total_loss, sim_loss, std_loss, cov_loss, repel_loss
+        # 3 & 4: Calculate Covariance Losses (Decouple feature correlations)
+        cov_ind_ingr = self._covariance_loss(ind_ingr.view(-1, ind_ingr.size(-1)))
+        cov_pool_ingr = self._covariance_loss(pooled_ingr)
+        cov_actions = self._covariance_loss(action_seq.view(-1, action_seq.size(-1)))
+
+        total_cov_loss = (cov_ind_ingr + cov_pool_ingr + cov_actions) / 3.0
+
+        # Weighted Total
+        loss = (self.sim_weight * sim_loss) + (self.var_weight * total_var_loss) + (self.cov_weight * total_cov_loss)
+
+        return loss, {"sim": sim_loss.item(), "var": total_var_loss.item(), "cov": total_cov_loss.item()}
+
+    def _variance_loss(self, x):
+        """Forces the standard deviation of each feature across the batch to approach 1.0"""
+        std = torch.sqrt(x.var(dim=0) + self.eps)
+        return torch.mean(nn.functional.relu(1.0 - std))
+
+    def _covariance_loss(self, x):
+        """Penalizes off-diagonal correlations linearly using L1 norm"""
+        batch_size = x.size(0)
+        if batch_size <= 1:
+            return torch.tensor(0.0, device=x.device)
+
+        # Center the features
+        x = x - x.mean(dim=0, keepdim=True)
+        # Compute Covariance Matrix [H, H]
+        cov = (x.T @ x) / (batch_size - 1)
+        dim = cov.size(0)
+        off_diag_abs = cov.abs().sum() - cov.diagonal().abs().sum()
+        return off_diag_abs / dim
 
 
 # =====================================================================
@@ -334,9 +366,10 @@ class JEPATrainer:
         os.makedirs(self.output_dir, exist_ok=True)
         for epoch in range(epochs):
             self.model.train()
-            train_loss_monitor = [0.0, 0.0, 0.0, 0.0]
+            train_loss_monitor = [0.0, 0.0, 0.0]
 
             for batch_idx, (x_tokens, a_tokens, y_tokens) in enumerate(self.train_loader):
+                vicreg_criterion = FullVicregLoss()
                 self.optimizer.zero_grad()
                 x_tokens, a_tokens, y_tokens = (
                     x_tokens.to(self.device),
@@ -344,69 +377,70 @@ class JEPATrainer:
                     y_tokens.to(self.device),
                 )
 
-                pred_embed, z_t = self.model(x_tokens, a_tokens)
+                # pred_embed, z_t = self.model(x_tokens, a_tokens)
+                pred_embed, z_t, element_latents, u_seq = self.model(x_tokens, a_tokens)
+
                 with torch.no_grad():
-                    true_embed = self.model.encode_target(y_tokens).detach()
+                    target_embed = self.model.encode_target(y_tokens).detach()
 
-                total_loss, sim_loss, std_loss, cov_loss, repel_loss = vicreg_loss(pred_embed, true_embed, z_t)
+                # total_loss, sim_loss, std_loss, cov_loss, repel_loss = vicreg_loss(pred_embed, true_embed, z_t)
+                # Compute the unified 4-point constraint loss
+                loss, loss_metrics = vicreg_criterion(
+                    pred_embed=pred_embed,
+                    target_embed=target_embed,
+                    ind_ingr=element_latents,
+                    pooled_ingr=z_t,
+                    action_seq=u_seq,
+                )
 
-                total_loss.backward()
+                loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                 self.optimizer.step()
                 self.scheduler.step()
 
-                self.model.update_target_ema(momentum=0.99)
+                self.model.update_target_ema(momentum=0.999)
 
-                sim_loss, std_loss, cov_loss, repel_loss = (
-                    sim_loss.item(),
-                    std_loss.item(),
-                    cov_loss.item(),
-                    repel_loss.item(),
-                )
-
-                train_loss_monitor[0] += sim_loss
-                train_loss_monitor[1] += std_loss
-                train_loss_monitor[2] += cov_loss
-                train_loss_monitor[3] += repel_loss
+                train_loss_monitor[0] += loss_metrics["sim"]
+                train_loss_monitor[1] += loss_metrics["var"]
+                train_loss_monitor[2] += loss_metrics["cov"]
 
                 self.global_step += 1
 
                 if batch_idx % 100 == 0:
                     print(
                         f"Batch: {batch_idx}/{len(self.train_loader)} |",
-                        f"SIM: {sim_loss:.4f} |",
-                        f"STD: {std_loss:.4f} |",
-                        f"COV: {cov_loss:.4f} |",
-                        f"REPEL: {repel_loss:.4f}",
+                        f"SIM: {loss_metrics['sim']:.4f} |",
+                        f"STD: {loss_metrics['var']:.4f} |",
+                        f"COV: {loss_metrics['cov']:.4f}",
                     )
 
             epoch_train_sim = train_loss_monitor[0] / len(self.train_loader)
             epoch_train_std = train_loss_monitor[1] / len(self.train_loader)
             epoch_train_cov = train_loss_monitor[2] / len(self.train_loader)
-            epoch_train_rep = train_loss_monitor[3] / len(self.train_loader)
-            epoch_val_sim, epoch_val_std, epoch_val_cov, epoch_val_rep = self.validate()
+            epoch_val_sim, epoch_val_std, epoch_val_cov = self.validate()
 
             print(
                 f"Epoch {epoch + 1:02d} |",
                 f"Train SIM: {epoch_train_sim:.4f} |",
                 f"STD: {epoch_train_std:.4f} |",
-                f"COV: {epoch_train_cov:.4f} |",
-                f"REP: {epoch_train_rep:.4f}",
+                f"COV: {epoch_train_cov:.4f}",
             )
             print(
                 f"Epoch {epoch + 1:02d} |",
                 f"Val SIM: {epoch_val_sim:.4f} |",
                 f"STD: {epoch_val_std:.4f} |",
-                f"COV: {epoch_val_cov:.4f} |",
-                f"REP: {epoch_val_rep:.4f}",
+                f"COV: {epoch_val_cov:.4f}",
             )
 
             if epoch_val_sim < (self.best_val_sim - self.min_delta):
                 self.best_val_sim = epoch_val_sim
                 self.patience_counter = 0
                 torch.save(self.model.state_dict(), os.path.join(self.output_dir, "recipe_jepa_model_best.pt"))
+                print("Saved new best model!")
             else:
                 self.patience_counter += 1
+                print(f"Early stopping, patience step: {self.patience_counter}")
+            print()
 
             if self.patience_counter >= self.patience:
                 print("[🛑] Early stopping triggered.")
@@ -416,16 +450,24 @@ class JEPATrainer:
     @torch.no_grad()
     def validate(self):
         self.model.eval()
-        val_loss_monitor = [0.0, 0.0, 0.0, 0.0]
+        val_loss_monitor = [0.0, 0.0, 0.0]
         for x_tokens, a_tokens, y_tokens in self.val_loader:
             x_tokens, a_tokens, y_tokens = x_tokens.to(self.device), a_tokens.to(self.device), y_tokens.to(self.device)
-            pred_embed, z_t = self.model(x_tokens, a_tokens)
-            true_embed = self.model.encode_target(y_tokens).detach()
-            _, sim_loss, std_loss, cov_loss, rep_loss = vicreg_loss(pred_embed, true_embed, z_t)
-            val_loss_monitor[0] += sim_loss.item()
-            val_loss_monitor[1] += std_loss.item()
-            val_loss_monitor[2] += cov_loss.item()
-            val_loss_monitor[3] += rep_loss.item()
+            vicreg_criterion = FullVicregLoss()
+            # pred_embed, z_t = self.model(x_tokens, a_tokens)
+            pred_embed, z_t, element_latents, u_seq = self.model(x_tokens, a_tokens)
+            target_embed = self.model.encode_target(y_tokens).detach()
+            loss, loss_metrics = vicreg_criterion(
+                pred_embed=pred_embed,
+                target_embed=target_embed,
+                ind_ingr=element_latents,
+                pooled_ingr=z_t,
+                action_seq=u_seq,
+            )
+            # _, sim_loss, std_loss, cov_loss, rep_loss = vicreg_loss(pred_embed, true_embed, z_t)
+            val_loss_monitor[0] += loss_metrics["sim"]
+            val_loss_monitor[1] += loss_metrics["var"]
+            val_loss_monitor[2] += loss_metrics["cov"]
         return [v / len(self.val_loader) for v in val_loss_monitor]
 
 
@@ -498,30 +540,34 @@ def handle_inference(args, device):
 
         x_tokens = tokenize_to_3d_input(args.ingredients)
         a_tokens = tokenize_to_3d_input(args.action)
+        # 1. Forward through full model to get the prediction vector
+        pred_embed, _, _, _ = model(x_tokens, a_tokens)
 
-        pred_z_next, _ = model(x_tokens, a_tokens)
+        # 2. Project prediction onto a unit hypersphere
+        pred_embed_norm = nn.functional.normalize(pred_embed, p=2, dim=-1)
 
-        # Tokenize targets array using standard flat 2D strategy
-        y_enc = tokenizer(targets_list, max_length=128, padding="max_length", truncation=True, return_tensors="pt")
-        y_tokens_batch = y_enc["input_ids"].to(device)
+        results = []
+        for target_str in targets_list:
+            # 3. Get raw target embedding, explicitly pulling out the input_ids tensor
+            target_tokens = tokenizer(target_str, add_special_tokens=False, return_tensors="pt")["input_ids"].to(device)
+            target_embed = model.encode_target(target_tokens)  # Now receives [1, sequence_length] tensor
 
-        true_z_next_batch = model.encode_target(y_tokens_batch)
+            # 4. Project target onto the same unit hypersphere
+            target_embed_norm = nn.functional.normalize(target_embed, p=2, dim=-1)
 
-        rankings = []
-        for idx, target_str in enumerate(targets_list):
-            true_z_next = true_z_next_batch[idx].unsqueeze(0)
-            distance = nn.functional.mse_loss(pred_z_next, true_z_next).item()
-            rankings.append((target_str, distance))
+            # 5. Compute Normalized MSE
+            normalized_mse = torch.mean((pred_embed_norm - target_embed_norm) ** 2).item()
+            results.append((target_str, normalized_mse))
 
-        rankings.sort(key=lambda x: x[1])
+    # Rank from closest angle to furthest
+    results.sort(key=lambda x: x[1])
 
-    print("\n" + "=" * 60)
-    print(f" INITIAL STATE (s_t): {args.ingredients}")
-    print(f" ACTION (a_t):        {args.action}")
-    print("=" * 60)
-    for target, score in rankings:
-        print(f"{target:<30} | MSE: {score:.6f}")
-    print("=" * 60)
+    print("\n============================================================")
+    print(" EVALUATION WITH L2 UNIT-NORMALIZATION")
+    print("============================================================")
+    for target_str, score in results:
+        print(f"{target_str:<30} | Normalized MSE: {score:.6f}")
+    print("============================================================")
 
 
 def main():
@@ -533,7 +579,7 @@ def main():
     train_parser.add_argument("--val_dataset", type=str, default="data/recipe_val.parquet")
     train_parser.add_argument("--output_dir", type=str, default="checkpoints")
     train_parser.add_argument("--log_dir", type=str, default="runs/recipe_jepa_experiment")
-    train_parser.add_argument("--batch_size", type=int, default=64)
+    train_parser.add_argument("--batch_size", type=int, default=16)
     train_parser.add_argument("--epochs", type=int, default=50)
     train_parser.add_argument("--lr", type=float, default=2e-4)
     train_parser.add_argument("--patience", type=int, default=3)
