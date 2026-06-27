@@ -10,7 +10,7 @@ model:
 loss:
   sim_weight: 1.0
   var_weight: 25.0
-  cov_weight: 5.0
+  cov_weight: 25.0
   hinge_epsilon: 0.0001
 
 train:
@@ -19,7 +19,7 @@ train:
   output_dir: "checkpoints"
   log_dir: "runs/recipe_jepa_experiment"
   batch_size: 16
-  epochs: 50
+  epochs: 20
   lr: 0.0002
   weight_decay: 0.01
   patience: 3
