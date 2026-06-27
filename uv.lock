@@ -368,6 +368,7 @@ dependencies = [
 [package.dev-dependencies]
 dev = [
     { name = "deptry" },
+    { name = "huggingface-hub" },
     { name = "pre-commit" },
     { name = "pytest" },
     { name = "ruff" },
@@ -385,6 +386,7 @@ requires-dist = [
 [package.metadata.requires-dev]
 dev = [
     { name = "deptry", specifier = ">=0.25.1" },
+    { name = "huggingface-hub", specifier = ">=1.20.1" },
     { name = "pre-commit", specifier = ">=4.6.0" },
     { name = "pytest", specifier = ">=9.0.3" },
     { name = "ruff", specifier = ">=0.15.15" },

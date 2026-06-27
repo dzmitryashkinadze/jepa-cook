@@ -3,6 +3,8 @@
 
 Unlike typical generative text models, this model captures knowledge within a narrow domain by treating state changes as non-generative trajectories—efficiently interpolating the semantic space between base components.
 
+Model on [HF](https://huggingface.co/DzmitryAshkinadze/jepa-cook/tree/main)
+
 ## Key Features
 - **JEPA Architecture**: Maps raw ingredients and processing sequences into a stable, continuous latent space.
 - **VICReg Loss**: Implements a loss function based on **Variance-Invariance-Covariance Regularization** to prevent representation collapse.
@@ -14,7 +16,6 @@ Was taken from [here](https://www.kaggle.com/datasets/wilmerarltstrmberg/recipe-
 ## Tech Stack
 - **Core**: [PyTorch](https://pytorch.org/)
 - **NLP**: [Hugging Face Transformers](https://huggingface.co/docs/transformers/index)
-
 ## Installation
 Ensure you have Python 3.12 or newer installed. You can install and synchronize all dependencies using `uv`:
 ```bash
@@ -48,18 +49,20 @@ uv run python scripts/filter_dataset.py
 
 Kick off the self-supervised training loop. The entry-point parses configurations from `config.yaml` and automatically handles target compute allocations (cuda, mps, or cpu):
 ```bash
-uv run python -m jepa_cook.src.main train
+uv run python -m jepa_cook.src.cli train
 ```
 
 To explicitly pass an alternate configuration profile layout:
 ```bash
-uv run python -m jepa_cook.src.main train --config config.yaml
+uv run python -m jepa_cook.src.cli train --config config.yaml
 ```
 
-### Inference & Hypersphere Ranking
+### Inference
 Evaluate your trained model by predicting trajectories across multiple target dish candidates. The inference engine ranks targets using an L2 unit-normalized Mean Squared Error (MSE):
+
+Option A: Running Local Checkpoints
 ```bash
-uv run python -m jepa_cook.src.main inference \
+uv run python -m jepa_cook.src.cli inference \
   --checkpoint checkpoints/recipe_jepa_model_best.pt \
   --ingredients '["cream", "egg yolks", "sugar"]' \
   --action '["whisk over water bath until thickened and chill"]' \
@@ -75,10 +78,16 @@ uv run python -m jepa_cook.src.main inference \
 > ============================================================
 ```
 
+Option B: Testing Directly from Hugging Face Hub
+You can also run zero-setup evaluation using the weights and configurations stored directly on the Hugging Face Hub by executing our reference inference script:
+```bash
+uv run python scripts/hf_inference_example.py
+```
+
 ### System Diagnostics
 Run a comprehensive diagnostic sweep over your model checkpoint to verify representation stability and verify that the context vectors are routing effectively without collapsing:
 ```bash
-uv run python -m jepa_cook.src.main diagnostics --checkpoint checkpoints/recipe_jepa_model_best.pt
+uv run python -m jepa_cook.src.cli diagnostics --checkpoint checkpoints/recipe_jepa_model_best.pt
 ```
 
 ## Architecture Details

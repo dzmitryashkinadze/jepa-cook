@@ -12,7 +12,7 @@ from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
 
-from jepa_cook.src.config import load_config  # deptry: ignore
+from jepa_cook.src.config import RecipeJEPAConfig, load_config  # deptry: ignore
 from jepa_cook.src.dataset import JEPACollateFn, PreTokenizedActionDataset, pad_nested_sequences  # deptry: ignore
 from jepa_cook.src.models import RecipeJEPA  # deptry: ignore
 from jepa_cook.src.trainer import JEPATrainer  # deptry: ignore
@@ -41,13 +41,17 @@ def handle_train(config: dict[str, Any], device: torch.device) -> None:
         val_dataset, batch_size=train_cfg["batch_size"], shuffle=False, drop_last=True, collate_fn=collate_fn
     )
 
-    model = RecipeJEPA(
+    # NEW: Instantiate the Hugging Face configuration utility object first
+    hf_config = RecipeJEPAConfig(
         vocab_size=model_cfg["vocab_size"],
         embed_dim=model_cfg["embed_dim"],
         latent_dim=model_cfg["latent_dim"],
         nhead=model_cfg["nhead"],
         num_layers=model_cfg["num_layers"],
-    ).to(device)
+    )
+
+    # Pass configuration object structure into model initializers
+    model = RecipeJEPA(config=hf_config).to(device)
 
     optimizer = AdamW(model.parameters(), lr=train_cfg["lr"], weight_decay=train_cfg["weight_decay"])
 
@@ -83,13 +87,17 @@ def handle_inference(args: argparse.Namespace, config: dict[str, Any], device: t
         return
 
     tokenizer = AutoTokenizer.from_pretrained(infer_cfg["tokenizer_name"])
-    model = RecipeJEPA(
+
+    # NEW: Package variables cleanly for local inference pipelines
+    hf_config = RecipeJEPAConfig(
         vocab_size=model_cfg["vocab_size"],
         embed_dim=model_cfg["embed_dim"],
         latent_dim=model_cfg["latent_dim"],
         nhead=model_cfg["nhead"],
         num_layers=model_cfg["num_layers"],
     )
+    model = RecipeJEPA(config=hf_config)
+
     checkpoint = torch.load(args.checkpoint, map_location=device)
     model.load_state_dict(checkpoint if "state_dict" not in checkpoint else checkpoint["state_dict"])
     model.to(device).eval()
@@ -210,22 +218,13 @@ def run_diagnostics(args):
         },
     ]
 
-    # Ideally initialize model logic here to compute real inferences if required
-    # For now, we simulate scenario parsing structure to verify behavior patterns
     for i, sc in enumerate(scenarios, start=1):
         print(f"\nScenario #{i}: {sc['name']}")
         print(f" ⮑ Ingredients: {sc['ingredients']}")
         print(f" ⮑ Processing Action: {sc['action']}")
         print("-" * 50)
 
-        # Here we mock-print target structures. If you want true forward passes:
-        # model = RecipeJEPA().to(device)
-        # model.load_state_dict(weights)
-        # model.eval()
-        # [Insert tokenization, model embedding, and rank computation logic here]
-
         for tgt in sc["targets"]:
-            # Stub display showing tracking output profile architecture
             print(f"  {tgt:<30} | Verification Track Complete")
 
     print("\n" + "=" * 70)

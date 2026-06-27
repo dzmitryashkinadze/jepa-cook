@@ -10,6 +10,9 @@ wheels/
 # Virtual environments
 .venv
 
+# hf
+upload_to_hf.py
+
 # data
 data/
 runs/
